@@ -1,0 +1,21 @@
+topology:
+  k: 8                         # switch port count, even, >= 4
+  type: fat-tree                # fat-tree | traditional-tree (conventional oversubscribed tree, for comparison)
+failures:
+  link_pct: 1                  # % of links that fail; can also be a [min, max] range,
+                                # e.g. [0, 20], to pick a random pct each run (seeded)
+  switch_pct: 0                # % of switches that fail (node + all its links removed)
+                                # also accepts a [min, max] range, same as link_pct
+  link_layers: [edge-agg, agg-core]   # host-edge excluded by default
+  switch_layers: [core, agg, edge]
+  mode: exact                  # exact = round(pct*N) uniform without replacement
+                                # bernoulli = each element fails independently with p
+traffic:
+  pattern: random               # random | stride | all-to-all | incast | same-pod | staggered
+  stride: 1                     # used when pattern = stride
+  load: 0.8                     # each host sends at load * link rate
+routing: ecmp                   # ecmp | two-level | single-path
+link_capacity_gbps: 1
+trials: 30
+seed: 1
+output_dir: results
