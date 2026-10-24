@@ -10,38 +10,51 @@ Implements and analyzes a three-tier fat-tree data center topology, consistent w
 
 ## Approach
 
-This is a **flow-level graph simulation**, not a packet-level emulator (the paper's
-evaluation used Click; this project does not). The topology, addressing, and failure
-model are built on top of [networkx](https://networkx.org/): switches and hosts are
-graph nodes, links are edges, and failures are modeled as node/edge removal. Routing
-and flow-level traffic/throughput analysis are layered on top of the resulting graph.
+This is a **graph/flow-level simulation**, not a packet-level emulator for the
+large-scale experiments (the paper's own evaluation used Click; most of this
+repo's results use a graph-only or max-min-fair flow model instead, for speed at
+large `k`). A genuine discrete-event **packet-level** engine also exists
+(`fattree/sim/packet.py`) for the small-`k` micro-behavior questions it's suited
+to — see [Simulation levels](#simulation-levels) below for when each is used and
+why. The topology, addressing, and failure model are built on top of
+[networkx](https://networkx.org/): switches and hosts are graph nodes, links are
+edges, and failures are modeled as node/edge removal.
 
 The topology generator (`fattree/topology.py`) reproduces the paper's three-tier
 structure (core / aggregation / edge / hosts) and its IP addressing scheme (Sec. 3.2),
 including the agg-switch-to-core-row connection rule and the Fig. 3 worked example,
-which are both covered by `tests/test_topology.py`.
+which are both covered by `tests/test_topology.py`. Traffic patterns
+(`fattree/traffic.py`), five routing schemes including the paper's actual two-level
+algorithm (`fattree/routing/`), and three simulation engines (`fattree/sim/`) are
+layered on top.
 
 ## Repository layout
 
 ```
 fattree/
-  topology.py   # build k-ary fat-tree + traditional tree, paper addressing, validate()
-  failures.py   # link + switch failures, per layer, exact/bernoulli, fixed or randomized pct
-  config.py     # config loading, defaults, validation
-  metrics.py    # switches-with-failed-links metric + closed-form theory
+  topology.py    # build k-ary fat-tree + traditional tree, paper addressing, validate()
+  failures.py    # link + switch failures, per layer, exact/bernoulli, fixed or randomized pct
+  config.py      # config loading, defaults, validation
+  metrics.py     # switches-with-failed-links metric + closed-form theory
+  traffic.py     # 8 traffic patterns (paper Sec. 5.2) + flow-size/class models
+  routing/       # single-path, ecmp, two-level (paper Alg. 1/2), classifier (Alg. 3), scheduler
+  sim/
+    graph.py     # structure-only connectivity/path metrics (edge-switch aggregation trick)
+    flow.py      # max-min fair rate allocation (progressive filling)
+    packet.py    # discrete-event packet simulator, k <= 8 only
 config/
-  default.yaml  # one scenario
-run.py          # CLI: build a topology, apply failures, print a summary
-visualize.py    # CLI: topology diagram, failure summary chart, sweep plot
-analysis.py     # CLI: run the k-sweep experiment below, write results/*.csv + figures/*.png
-figures/        # PNG diagrams and plots (committed)
-results/        # CSV sweep output (committed)
-tests/          # pytest: topology facts, failures, config, metrics
+  default.yaml   # one scenario
+run.py           # CLI: build a topology, apply failures, print a summary
+visualize.py     # CLI: topology diagram, failure summary chart, experiment plots
+analysis.py      # CLI: experiment subcommands -> results/*.csv + figures/*.png
+figures/         # PNG diagrams and plots (committed)
+results/         # CSV experiment output (committed)
+tests/           # pytest: topology, failures, config, traffic, routing, sim, metrics
 ```
 
-Planned for Phase 2 (full submission, see `CLAUDE.md`): `traffic.py`, `routing.py`,
-the rest of `metrics.py` (§6's full list), the `web/` GitHub Pages site, and
-additional result plots/discussion.
+Not built: the `web/` GitHub Pages interactive site, and 5 of the 9 experiments
+in `PHASE2_PROMPT.md` (noted individually under [Results](#results) and
+[Not done / future work](#not-done--future-work) below) given the submission deadline.
 
 ## Topology diagram
 
@@ -92,6 +105,59 @@ the same failure rate barely dents connectivity because every edge/agg switch ha
 checks this directly by removing one edge-agg link and asserting those hosts become
 unreachable.
 
+## Routing schemes
+
+`fattree/routing/` implements five schemes behind one `Router` interface
+(`route(flow)`, `on_failure(...)`, `stats()`):
+
+- **single-path** — one fixed shortest path per destination, computed once and
+  never recomputed; a failure on that path simply drops the flow (OSPF-like
+  baseline, no multi-path diversity).
+- **ecmp** — hashes each flow onto one of the currently available equal-cost
+  shortest paths; since it recomputes live over the current (post-failure)
+  graph on every call, it reroutes automatically.
+- **two-level** — the paper's actual algorithm (Sec. 3.3–3.5, Algorithms 1 and
+  2, with the documented destination-pod typo in Algorithm 2 fixed). Builds
+  real prefix/suffix forwarding tables per switch; the agg→core port-to-core
+  wiring was reverse-engineered from the paper's own worked example and
+  verified to reproduce it exactly (`tests/test_routing.py::test_two_level_matches_paper_fig3_example`).
+  Static by default (`two_level.failover: false` — a failure on the table-driven
+  path just drops the flow, matching the paper's Sec. 3.1 critique of this
+  weakness); `failover: true` approximates Sec. 3.8's reroute-when-a-choice-exists
+  behavior.
+- **classifier** — Algorithm 3: new flows go to the least-loaded upward port;
+  periodically, up to `classifier.max_moves` flows move from the most- to the
+  least-loaded port if that reduces the imbalance.
+- **scheduler** — Sec. 3.7/4.3: a central scheduler reserves one of the
+  `(k/2)²` inter-pod core paths (or `k/2` intra-pod agg paths) per elephant
+  flow (`traffic.elephant_threshold_bytes`); mice use two-level.
+
+## Simulation levels
+
+`simulation.level` picks the engine (`fattree/sim/`), trading fidelity for
+speed — the paper used packet-level Click emulation throughout; this repo
+instead picks the *cheapest* level that still answers each question, since a
+full packet simulation at `k=48` (27,648 hosts) is not tractable in reasonable
+time with a Python discrete-event loop:
+
+- **graph** — structure only, no traffic or routing. Fast enough for `k=48` in
+  under a second (`fattree/sim/graph.py`'s edge-switch aggregation trick — see
+  its docstring). Used for `critical_failure_pct_vs_k` and `link_vs_switch`.
+  Limitation: no notion of load, capacity, or congestion.
+- **flow** — routes every flow, then computes max-min fair rates (progressive
+  filling) over link capacities. No queueing: a congested link's flows share it
+  perfectly and instantly, with no buildup or loss. Used for `table2_reproduction`
+  and `throughput_vs_failures`. Limitation: cannot show queueing delay, drops,
+  or reordering.
+- **packet** — genuine discrete-event simulation (FIFO drop-tail queues,
+  store-and-forward, UDP or simple ACK/window transport), restricted to `k ≤ 8`
+  since it is the slowest engine by orders of magnitude. The right tool for
+  queueing/drop/reordering/FCT questions — not used in this submission's 4
+  highlighted experiments, but exercised directly by `tests/test_sim_packet.py`
+  (see [Not done / future work](#not-done--future-work) for the packet-level
+  experiments that were designed but not run under the deadline). Limitation:
+  no congestion control beyond a fixed window, no multi-flow TCP fairness.
+
 ## Input parameters
 
 Set via `config/default.yaml` (or any `-c <path>`), overridable on the command line.
@@ -106,14 +172,20 @@ Set via `config/default.yaml` (or any `-c <path>`), overridable on the command l
 | Failure layers (links)     | `failures.link_layers`  | —                | `[edge-agg, agg-core]` | Which link layers are eligible to fail. |
 | Failure layers (switches)  | `failures.switch_layers`| —                | `[core, agg, edge]`    | Which switch layers are eligible to fail. |
 | Failure mode                | `failures.mode`         | `--mode`         | `exact` | `exact` = `round(pct·N)` chosen uniformly without replacement; `bernoulli` = each element fails independently with probability `p = pct/100`. |
-| Traffic pattern            | `traffic.pattern`       | `--pattern`      | `random` | `random \| stride \| all-to-all \| incast \| same-pod \| staggered` (Phase 2). |
-| Offered load                | `traffic.load`          | `--load`         | 0.8     | Each host sends at `load × link rate` (Phase 2). |
-| Routing scheme              | `routing`                | `--routing`      | `ecmp`  | `ecmp \| two-level \| single-path` (Phase 2). |
+| Traffic pattern            | `traffic.pattern`       | `--pattern`      | `random` | `random \| stride \| staggered \| same-pod \| all-to-all \| incast \| inter-pod-incoming \| same-id-outgoing` — see `fattree/traffic.py`. |
+| Flow size model             | `traffic.size_model`    | —                | `mice-elephants` | `fixed \| mice-elephants \| empirical`; controls flow sizes and mouse/elephant classification (`traffic.elephant_threshold_bytes`). |
+| Offered load                | `traffic.load`          | `--load`         | 1.0     | Each host sends at `load × link rate`. |
+| Routing scheme              | `routing`                | `--routing`      | `two-level` | `single-path \| ecmp \| two-level \| classifier \| scheduler` — see [Routing schemes](#routing-schemes). |
+| Simulation level             | `simulation.level`      | —                | `flow`  | `graph \| flow \| packet` (packet only for `k <= 8`) — see [Simulation levels](#simulation-levels). |
 | Random seed                 | `seed`                   | `--seed`         | 1       | Every random choice is seeded; trial `t` uses `seed + t`. |
-| Trials per config point      | `trials`                 | `--trials`       | 30      | Repetitions for Phase 2 sweeps. |
+| Trials per config point      | `trials`                 | `--trials`       | 30      | Repetitions for sweeps. |
 
 Config and CLI are validated with explicit errors (odd `k`, out-of-range percentages,
-unknown pattern/routing/mode, ...) — see `fattree/config.py`.
+unknown pattern/routing/mode, ...) — see `fattree/config.py`. The full traffic/routing/
+packet config schema (20+ additional keys: `subnet_p`, `incast_senders`,
+`elephant_fraction`, `two_level.failover`, `classifier.max_moves`,
+`packet.transport`, `packet.spraying`, ...) is documented inline in
+`config/default.yaml`, not duplicated here.
 
 ## Install & run
 
@@ -139,8 +211,12 @@ python run.py -c config/default.yaml --json
 # draw the topology + a small pie/bar failure summary chart
 python visualize.py -c config/default.yaml --out figures/topology.png --summary-out figures/summary.png
 
-# run the switches-with-failed-links-vs-k experiment (see Results below)
-python analysis.py --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1
+# experiments (analysis.py subcommands; see Results below for each one's write-up)
+python analysis.py switches-multifail --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1
+python analysis.py critical-failure-pct --ks 4 8 16 24 32 --trials 10
+python analysis.py table2 --k 4 --trials 15
+python analysis.py throughput-vs-failures --ks 8 16 --pcts 0 5 10 15 20 25 30 --trials 15
+python analysis.py link-vs-switch --k 16 --pcts 0 1 2 5 10 15 20 --trials 15
 ```
 
 Example output:
@@ -166,8 +242,17 @@ addressing example; shortest-path hop counts (2/4/6 hops for same-edge/same-pod/
 cross-pod host pairs); failure-count correctness and determinism under a fixed seed
 (including randomized `[min, max]` failure-pct ranges); config validation/merging;
 the traditional-tree baseline's counts, connectivity, and lack of path redundancy;
-and the switches-with-failed-links metric against a brute-force enumeration of all
-`2^k` failure patterns for small k (see Results below).
+the switches-with-failed-links metric against a brute-force enumeration of all
+`2^k` failure patterns for small k; all 8 traffic patterns' structural properties
+(bijection/derangement, stride correctness, per-pattern invariants) and flow-size
+class fractions; every routing scheme (valid/deterministic paths, failure
+behavior, and the two-level router against the paper's own Fig. 3 worked
+example); and all three simulation levels, including `fattree/sim/graph.py`'s
+metrics against brute-force host-pair BFS across several `k`/failure
+combinations, `fattree/sim/flow.py`'s max-min fairness against the classic
+asymmetric-bottleneck textbook example, and `fattree/sim/packet.py`'s exact
+delay/drop/reorder/retransmission properties (see Results below). 180 tests,
+all passing.
 
 ## Results
 
@@ -191,7 +276,7 @@ exactly `k` ports:
 P(≥2 of k ports fail) = 1 - (1-p)^k - k·p·(1-p)^(k-1)
 ```
 
-Reproduce with `python analysis.py --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1`
+Reproduce with `python analysis.py switches-multifail --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1`
 (any subset of `allowed_k` works, including 48/64) → `results/switches_multifail_vs_k.csv`
 + the plot below.
 
@@ -208,49 +293,252 @@ failed links is the precursor to a *structural* break: in the fat-tree a single
 failed uplink is absorbed by ECMP across the remaining `k/2 - 1` parallel paths,
 but a switch losing multiple ports simultaneously shrinks its usable fan-out and
 raises the chance that *all* paths through it are gone — which is exactly the
-scenario the capacity/oversubscription metrics (planned, §6) will quantify next.
+scenario the `link-vs-switch` experiment below quantifies directly.
 It also explains why larger (`higher-radix`) fat-trees, despite offering more raw
 bisection bandwidth, need proportionally more aggressive failure monitoring: the
 same per-link failure rate produces a disproportionately larger multi-failure
 switch population as `k` grows, since this is a ≈`k²·p²` effect (choose 2-of-`k`
 ports, each ∝ `p`).
 
-### Planned (see `CLAUDE.md` §6 for the full list)
+### Throughput vs. link failure probability, by routing scheme
 
-- Connectivity: fraction of connected host pairs, isolated hosts, avg. shortest path
-  length / stretch, path diversity, diameter — including a fat-tree vs.
-  traditional-tree comparison using the new `topology.type` option.
-- Capacity: min pod-to-pod max-flow, edge/agg oversubscription after failures.
-- Routing/load: link utilization, max link load, throughput vs. ideal, ECMP vs.
-  two-level vs. single-path.
+This is the assignment's "advanced" example metric (Sec. 5): a non-trivial
+performance metric as a function of failure probability — here, achieved
+throughput (flow level) rather than path length, since it captures both
+connectivity *and* capacity loss in one number and directly separates the five
+routing schemes by how gracefully they degrade.
+
+**Setup.** For `k ∈ {8, 16}`, link failure % ∈ `{0, 5, 10, 15, 20, 25, 30}`
+(bernoulli, edge-agg + agg-core), 15 seeded trials per point, `random` traffic,
+flow level: build the topology, apply failures, build each of 5
+routers/configurations on the *post-failure* graph (two-level, two-level with
+`failover: true`, ecmp, classifier, scheduler), route all flows, and measure
+throughput as % of ideal (`fattree/sim/flow.py`).
+
+Reproduce: `python analysis.py throughput-vs-failures --ks 8 16 --pcts 0 5 10 15 20 25 30 --trials 15`
+→ `results/throughput_vs_failures.csv` + the plot below.
+
+![Throughput vs. link failure %, by routing scheme, for k=8 and k=16: ECMP degrades slowest, plain two-level fastest, failover and classifier in between](figures/throughput_vs_failures.png)
+
+**Discussion.** All five schemes decline roughly linearly with failure %, but
+at very different rates — exactly the "how gracefully does it degrade" question
+this metric is designed to expose. **ECMP degrades slowest** (k=8: 47.4%→37.6%
+from 0%→30% failure, a 20.7% relative drop; k=16: 42.7%→34.5%, a 19.2% drop)
+because it recomputes shortest paths fresh on every call, so it automatically
+routes around failed links whenever an equal-cost alternative exists — the
+fat-tree's built-in path redundancy is directly visible here. **Plain
+two-level degrades fastest** (k=8: 52.0%→22.0%, a 57.7% relative drop) because
+its tables are static: a flow whose table-driven hop crosses a failed link is
+simply dropped, with no attempt to use the `k/2 - 1` other equally-valid
+upward ports that may still be alive. **Enabling `two_level.failover`
+recovers a meaningful fraction of that gap** (k=8 at 30% failure: 22.0% static
+vs. 28.8% with failover, a 6.8-point recovery) by retrying another live port
+at the same switch instead
+of dropping outright — direct, quantitative evidence for the paper's own
+Sec. 3.8 motivation for adding failover to an otherwise-static scheme.
+**Classifier starts highest and stays highest** at every failure level (its
+least-loaded-port placement already does better load balancing than the
+fixed host-ID formula even at 0% failure, and that advantage persists under
+failure), while **scheduler tracks close to plain two-level** — its reserved
+elephant paths help throughput at the margins but do not fundamentally change
+how it reacts to a failed link along a chosen path. The comparison across `k`
+is also informative: every curve is lower at `k=16` than at `k=8` at the same
+failure %, since `random` permutation traffic scatters more flows across more
+possible hotspots as the network grows, even though (per the critical-failure-%
+experiment above) the *same* `k=16` network is far more resistant to losing
+connectivity outright — throughput degrades gracefully long before
+connectivity collapses.
+
+### Critical link failure % vs. switch port count
+
+**Setup.** For each `k ∈ {4, 8, 16, 24, 32}`, binary-search (resolution 1%,
+range 0–99%) the smallest *link* failure % (bernoulli, edge-agg + agg-core)
+at which mean host-pair connectivity (`fattree/sim/graph.py`, 10 seeded trials
+per candidate %) drops below 99.9%, and separately below 99%. This is the
+graph level (no traffic/routing needed), so it scales to `k=32` in well under a
+minute; `k=48` also works (~3–4 min) via `--ks 4 8 16 24 32 48`.
+
+Reproduce: `python analysis.py critical-failure-pct --ks 4 8 16 24 32 --trials 10`
+→ `results/critical_failure_pct_vs_k.csv` + the plot below.
+
+![Critical link failure % vs. k: both the 99.9% and 99% connectivity thresholds rise steeply with k](figures/critical_failure_pct_vs_k.png)
+
+**Discussion.** The critical percentage rises sharply with `k`: from ~3.5% at
+`k=4` to ~61% (99.9% threshold) / ~72% (99% threshold) at `k=32`. This is the
+flip side of the previous experiment — a fat-tree's *raw* exposure to
+multi-failure switches grows with `k`, but its actual host-pair connectivity is
+far more robust at large `k`, because disconnecting a host pair requires
+wiping out *all* `(k/2)²` core paths between their pods, and `(k/2)²` grows
+quadratically while independent link failures only degrade that redundancy
+linearly in expectation. This is a direct, quantitative illustration of why
+the paper's Clos-based design scales: adding ports doesn't just add hosts, it
+adds *disproportionately more* fault tolerance per unit of failure probability.
+The practical reading for an operator: a fixed "redundant 5% of links are
+down" monitoring threshold is far more alarming at `k=4` than at `k=32` — the
+acceptable operating envelope widens with scale.
+
+### Link failures vs. switch failures at equal %
+
+**Setup.** At `k=16`, for `pct ∈ {0, 1, 2, 5, 10, 15, 20}`, compare two
+failure types at the *same* percentage (bernoulli, 15 seeded trials each):
+pure link failures (edge-agg + agg-core) vs. pure switch failures (edge + agg).
+Two metrics, both graph-level: fraction of host pairs connected, and inter-pod
+path diversity (`path_diversity`, pods 0 and 1, surviving shortest paths /
+`(k/2)²`).
+
+Reproduce: `python analysis.py link-vs-switch --k 16 --pcts 0 1 2 5 10 15 20 --trials 15`
+→ `results/link_vs_switch_failures.csv` + the plot below.
+
+![Link vs switch failures at equal %: switch failures cause far steeper connectivity loss; path diversity degrades similarly for both, with link failures slightly worse at high %](figures/link_vs_switch_failures.png)
+
+**Discussion.** On *connectivity*, switch failures are dramatically more
+damaging: at 20% switch failure, connectivity has dropped to ~63%, while 20%
+*link* failure leaves connectivity essentially untouched (>99.9%) at `k=16` —
+consistent with the previous experiment's finding that `k=16` needs ~45% link
+failure just to cross the 99.9% threshold. The reason is each switch failure's
+"blast radius": removing one edge or agg switch deletes `k` or `k/2` links at
+once (and, for an edge switch, isolates its `k/2` directly-attached hosts
+outright), so a given failure *percentage* of switches removes far more total
+connectivity than the same percentage of links. On *path diversity* between a
+fixed pod pair, the two curves are closer and link failures are actually
+*slightly* worse at high %, because the diversity metric only counts paths
+between two specific pods — independent link failures spread evenly cut into
+every one of the `(k/2)²` paths a little, while switch failures are "lumpier"
+(concentrated on whichever switches happen to fail) and so are somewhat more
+likely to leave some fully-intact paths untouched. Together these two panels
+make the case from `CLAUDE.md` §6 concrete: "link failures vs. switch failures
+at equal %" is not a redundant comparison — they degrade the network in
+qualitatively different ways, and a monitoring/alerting policy that only
+tracks link-level failure rate will badly underestimate the risk from switch
+failures.
+
+### Table 2 reproduction (paper Sec. 5, Table 2)
+
+**Setup.** At `k=4`, link rate 96 Mb/s (matching the paper), flow level, 10
+traffic patterns × 4 "schemes" × 15 seeded trials, measuring throughput as %
+of ideal (`fattree/sim/flow.py`'s max-min fair rate allocation). The patterns
+are the paper's: `random`, `stride` with stride ∈ {1,2,4,8}, `staggered` with
+`(subnet_p, pod_p)` ∈ {(1.0,0.0), (0.5,0.3), (0.2,0.3)}, `inter-pod-incoming`,
+and `same-id-outgoing`. "Scheme" here means *topology + routing* together, to
+match the paper's comparison: **tree** = our `traditional-tree` baseline (see
+above) + single-path routing (the only option on a single-path topology);
+**two-level**, **classifier**, **scheduler** = the fat-tree with that routing
+scheme.
+
+Reproduce: `python analysis.py table2 --k 4 --trials 15` →
+`results/table2_reproduction.csv` + the plot below (black ticks mark the
+paper's own reported values for comparison).
+
+![Table 2 reproduction: grouped bars (our simulation) vs. black ticks (paper's values), by pattern and scheme](figures/table2_reproduction.png)
+
+**Discussion.** The *shape* of the paper's result reproduces well: `tree`
+is clearly worst on the adversarial patterns (`inter-pod-incoming`: 8.3% here
+vs. the paper's 28%; `same-id-outgoing`: 23% vs. 28%), and `scheduler`
+is the most consistently strong performer, exactly as the paper argues (its
+central link-reservation scheme should dominate when it can afford the
+bookkeeping). The absolute numbers diverge from the paper's in two
+directions: our fat-tree-based schemes do *worse* than the paper on
+`inter-pod-incoming`/`same-id-outgoing` (two-level: 28%/51% here vs. 75%/39%
+there), and `tree` does worse across the board. Three real differences explain
+most of the gap rather than a bug: (1) our `traditional-tree` is not
+calibrated to the paper's specific 3.6:1 industry hardware ratio — it has its
+own (different, generally *more* oversubscribed at the single global core)
+structure, since adding a true tunable oversubscription parameter to
+`build_traditional_tree` was out of scope for this deadline (noted under
+[Not done / future work](#not-done--future-work)); (2) our `classifier` and
+`scheduler` are simplified approximations of Algorithms 3 and the Sec. 4.3
+scheduler, not literal re-implementations of the paper's exact heuristics; and
+(3) the paper measures over a real packet-level Click emulation with its own
+specific per-pattern flow counts and durations, while this is a single
+max-min-fair flow-level snapshot. The two numbers that should be most directly
+comparable — `random` and the `stride`/`staggered(1.0,0.0)` patterns, which
+have no exotic hotspot structure — do land close to the paper's values
+(`random`: our two-level 65% vs. paper's 75%; `stride1`/`staggered(1.0,0.0)`:
+100% for both, matching exactly), which is the strongest evidence the
+underlying routing/capacity model is sound and the divergence on the
+worst-case patterns is a modeling-fidelity gap, not a correctness bug.
+
+## Not done / future work
+
+`PHASE2_PROMPT.md` Step 5 specifies 9 experiments; given the submission
+deadline, the 4 above were prioritized (they best showcase the traffic/routing/
+simulation work and map directly onto the assignment's own example metrics).
+Five were designed but not run:
+
+- **collisions_vs_k** — throughput lost to two-level/ECMP hash collisions vs.
+  `k` (paper §5.3 predicts it shrinks as `k` grows). Mechanically similar to
+  `table2`/`throughput_vs_failures` (flow level, same routing schemes); mainly
+  blocked on time, not on missing infrastructure.
+- **scheduler_cost_vs_k** — time-per-placement and link/flow-state memory vs.
+  `k`, to compare against the paper's Table 3. `FlowSchedulerRouter.stats()`
+  already records exactly this (`placements`, `mean_placement_time_s`,
+  `link_state_entries`, `flow_state_entries`) — only the sweep-and-plot script
+  is missing.
+- **mice_vs_elephants**, **reordering_spraying_vs_hashing**, **incast** — all
+  packet-level (`k ∈ {4, 8}`). The packet engine itself is built and tested
+  (`fattree/sim/packet.py`, `tests/test_sim_packet.py` directly demonstrates
+  FCT-by-class, spraying-induced reordering, and incast-style queue drops at a
+  receiver) — these three just need their own sweep/plot wrappers in
+  `analysis.py`, the same pattern as the 4 experiments above.
+- The `web/` GitHub Pages interactive site (`CLAUDE.md` §7) — not started.
+- `build_traditional_tree`'s oversubscription is fixed by its structure, not a
+  tunable parameter (needed for an exact 3.6:1 match to the paper's Table 2
+  hardware; see the Table 2 discussion above).
+- `fattree/metrics.py`'s §6 list beyond `switches_with_multiple_failed_links`
+  (cables-per-host vs. k, % flows broken under static two-level without
+  rerouting) is not separately implemented, though several of its underlying
+  pieces now exist via `fattree/sim/graph.py` and the two-level `failover`
+  flag.
 
 ## AI usage
 
 This project was developed with AI assistance (Claude, Anthropic), used for:
-scaffolding the repository structure, implementing `fattree/topology.py`
+scaffolding the repository structure; implementing `fattree/topology.py`
 (including the traditional-tree baseline), `fattree/failures.py` (including the
-randomized `[min, max]` failure-pct ranges), `fattree/config.py`, `fattree/metrics.py`,
-`visualize.py`, and `analysis.py` from a specification written by the author (see
-`CLAUDE.md`), and writing the accompanying pytest suite (including the brute-force
-check of the closed-form multi-failure formula). All formulas, the addressing
-scheme, and the failure model were specified by the author with reference to the
-paper; the author has reviewed and understands every line submitted and is
-responsible for its correctness.
+randomized `[min, max]` failure-pct ranges), `fattree/config.py`,
+`fattree/metrics.py`, `fattree/traffic.py` (all 8 traffic patterns),
+`fattree/routing/` (all 5 schemes — the two-level router's exact port-wiring
+convention was reverse-engineered from the paper's own worked example, read
+directly from the PDF, and verified to reproduce it), `fattree/sim/` (all 3
+simulation engines), `visualize.py`, and `analysis.py`, all from a specification
+written by the author (see `CLAUDE.md` and `PHASE2_PROMPT.md`); and writing the
+accompanying pytest suite (180 tests), including brute-force/closed-form checks
+of the multi-failure formula and the graph-level connectivity metrics, and the
+paper-example verification for two-level routing. Three real bugs were found
+and fixed during this process by tracing actual behavior against expectations
+rather than trusting aggregate output (documented inline where fixed): a
+Python-level aggregation bottleneck in `fattree/sim/graph.py` (47s → <1s at
+k=48); `fattree/sim/flow.py` modeling links as undirected, which made
+opposite-direction flows on the same physical link falsely contend for one
+shared capacity (caught via the Table 2 reproduction showing an implausible
+flat 50% ceiling); and two bugs in `fattree/sim/packet.py`'s event scheduling
+(UDP pacing, window-transport ACK counting) caught by tracing actual packet
+delivery order rather than trusting aggregate counts. All formulas, the
+addressing scheme, and the failure/traffic/routing models were specified by
+the author with reference to the paper; the author has reviewed and
+understands every line submitted and is responsible for its correctness.
 
-## Status: work in progress
+## Status
 
-This is the Phase 1 submission, not the final homework. What's solid: topology
-generation (fat-tree + traditional tree), failure injection, config/CLI, and the
-one worked example above, all backed by passing tests. What's still ahead before
-Phase 2 (due 25/10):
+Phase 1 (topology, failures, config/CLI) and most of Phase 2
+(`PHASE2_PROMPT.md` Steps 1–4: allowed-k policy, traffic patterns, all 5
+routing schemes, all 3 simulation levels) are complete and tested. Of Step 5's
+9 experiments, 4 were run to completion with full write-ups above; the other 5
+are designed but not run, and the `web/` site is not started — see
+[Not done / future work](#not-done--future-work) for specifics. Known
+limitations of what *is* here:
 
-- **More bug testing.** The test suite covers the pieces built so far, but hasn't
-  been adversarially reviewed, and larger `k` / edge-case configs (e.g. `switch_pct`
-  + `link_pct` combined, very large sweeps) are undertested.
-- **More analysis metrics.** Only one of the metrics in `CLAUDE.md` §6 has an actual
-  experiment and plot; connectivity, capacity (max-flow/oversubscription), and
-  routing/load metrics are still just a list, and `traffic.py`/`routing.py` don't
-  exist yet.
-- **Visual improvements.** The topology diagrams and charts are functional but
-  plain — no IP-label tooltips, no interactive web view yet (`web/` per `CLAUDE.md`),
-  and the layered diagram gets dense/hard to read for larger `k`.
+- **Packet-level realism.** `fattree/sim/packet.py`'s window transport is a
+  simple fixed-window ACK/timeout scheme, not real TCP (no slow start, no
+  congestion avoidance, no multi-flow fairness beyond what max-min-style
+  queueing happens to produce).
+- **Traditional-tree calibration.** Its oversubscription ratio is whatever its
+  fixed structure produces, not a tunable match to the paper's specific
+  hardware (see the Table 2 discussion).
+- **Classifier/scheduler fidelity.** Both are functional approximations of the
+  paper's Algorithm 3 and Sec. 4.3 scheduler, not literal re-implementations —
+  the Table 2 discussion above quantifies where this shows up.
+- **Further adversarial testing.** The test suite is substantial (180 tests)
+  but has not been independently red-teamed; larger-`k` combinations of
+  simultaneous link + switch failures, and packet-level edge cases beyond what
+  Step 4's required properties covered, are comparatively undertested.

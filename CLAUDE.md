@@ -39,61 +39,71 @@ Deadlines:
   simulation**; state that in the README.
 
 ## 3. Repository layout
+
+**Status key:** ✅ built | ⬜ not built (see README.md "Not done / future work")
+
 ```
 Fat-Tree-Network-Topology/
 ├── config/
-│   ├── default.yaml            # one scenario
-│   └── experiments/*.yaml      # sweeps used for the analysis / README plots
+│   ├── default.yaml            # one scenario                                  ✅
+│   └── experiments/*.yaml      # not used; analysis.py subcommands take CLI    ⬜
+│                                 flags directly instead (pragmatic deviation,
+│                                 see README.md Install & run)
 ├── fattree/                    # simulation core (Python package)
-│   ├── topology.py             # build k-ary fat-tree, paper addressing, validate()
-│   ├── failures.py             # link + switch failures, per layer, exact or probabilistic
-│   ├── traffic.py              # traffic patterns + load
-│   ├── routing.py              # ECMP, paper two-level table, single shortest path
-│   ├── metrics.py              # all metrics (§6)
-│   ├── simulate.py             # one run: build -> fail -> route -> measure
-│   └── export.py               # topology/results -> JSON for the web page
-├── run.py                      # CLI: run a config or a sweep -> results/
-├── analysis.py                 # aggregate trials (mean, std, 95% CI) -> results/*.csv
-├── visualize.py                # results -> figures/*.png (line, bar, pie, heatmap)
-├── web/                        # GitHub Pages site (static)
+│   ├── topology.py             # build k-ary fat-tree + traditional tree,      ✅
+│   │                             paper addressing, validate()
+│   ├── failures.py             # link + switch failures, per layer, exact/     ✅
+│   │                             bernoulli, fixed or randomized [min,max] pct
+│   ├── traffic.py              # 8 traffic patterns (Sec. 5.2) + flow size/    ✅
+│   │                             class models
+│   ├── routing/                # single_path, ecmp, two_level (Alg. 1/2),     ✅
+│   │                             flow_classifier (Alg. 3), flow_scheduler
+│   │                             (package, not routing.py)
+│   ├── metrics.py              # switches_with_multiple_failed_links only;    partial
+│   │                             rest of §6 covered by fattree/sim/graph.py
+│   ├── sim/                    # graph.py, flow.py, packet.py (package, not   ✅
+│   │                             simulate.py -- one engine per file per
+│   │                             PHASE2_PROMPT.md Step 4)
+│   └── export.py               # topology/results -> JSON for the web page   ⬜
+├── run.py                      # CLI: build a topology, apply failures,       ✅
+│                                 print a summary (not yet wired to traffic/
+│                                 routing/sim -- those are driven by analysis.py)
+├── analysis.py                 # CLI subcommands, one per experiment, each    ✅ (4/9)
+│                                 aggregating trials -> results/*.csv +
+│                                 figures/*.png (see README.md Results)
+├── visualize.py                # topology diagram, failure summary chart,     ✅
+│                                 one plot function per analysis.py experiment
+├── web/                        # GitHub Pages site (static)                   ⬜
 │   ├── index.html, app.js, style.css
 │   ├── icons/                  # open-licensed SVG (Tabler/Lucide, MIT) or custom
 │   └── data/                   # JSON exported by fattree/export.py
-├── tests/                      # pytest
-├── results/  figures/          # committed outputs (README and site use them)
-├── README.md  CLAUDE.md  requirements.txt  .gitignore
-└── .github/workflows/          # run tests; deploy web/ to Pages
+├── tests/                      # pytest, 180 tests                            ✅
+├── results/  figures/          # committed outputs (README and site use them) ✅
+├── README.md  CLAUDE.md  PHASE2_PROMPT.md  requirements.txt  .gitignore       ✅
+└── .github/workflows/          # run tests; deploy web/ to Pages              ⬜
 ```
-
-Prototype code from an earlier session exists (`fattree.py`, `analysis.py`,
-`test_fattree.py`, all tests passing). Reuse its logic when moving it into the `fattree/`
-package, then delete the old files.
 
 ## 4. Configuration schema (config/default.yaml)
-```yaml
-topology:
-  k: 8                         # switch port count, even, >= 4
-  type: fat-tree                # fat-tree | traditional-tree (oversubscribed baseline for comparison)
-failures:
-  link_pct: 5                  # % of links that fail; or [min, max] to randomize per run (seeded)
-  switch_pct: 0                # % of switches that fail (node + all its links removed); same range option
-  link_layers: [edge-agg, agg-core]   # host-edge excluded by default
-  switch_layers: [core, agg, edge]
-  mode: exact                  # exact = round(pct*N) uniform without replacement
-                               # bernoulli = each element fails independently with p
-traffic:
-  pattern: random              # random | stride | all-to-all | incast | same-pod | staggered
-  stride: 1                    # used when pattern = stride
-  load: 0.8                    # each host sends at load * link rate
-routing: ecmp                  # ecmp | two-level | single-path
-link_capacity_gbps: 1
-trials: 30
-seed: 1
-sweep:                         # optional
-  param: failures.link_pct
-  values: [0, 1, 2, 5, 10, 15, 20, 30]
-output_dir: results
-```
+
+`config/default.yaml` is the canonical, fully-commented schema (not duplicated
+here to avoid drift) -- `fattree/config.py`'s `DEFAULTS` dict and
+`validate_config()` are its Python-side source of truth. Key sections, all
+implemented:
+- `allowed_k` -- real switch port counts `[4, 8, 16, 24, 32, 48, 64]`;
+  `topology.k` and any `sweep.values` for `topology.k` must come from this list.
+- `topology.{k, type}` -- `type: fat-tree | traditional-tree`.
+- `failures.{link_pct, switch_pct, link_layers, switch_layers, mode}` -- `*_pct`
+  accept a `[min, max]` range to randomize per run (seeded).
+- `traffic.*` -- `pattern` (8 options, Sec. 5.2), `size_model`
+  (`fixed | mice-elephants | empirical`), `elephant_fraction`,
+  `elephant_threshold_bytes`, `subnet_p`/`pod_p` (staggered), `incast_senders`, `load`.
+- `routing` -- `single-path | ecmp | two-level | classifier | scheduler`; plus
+  `two_level.failover` and `classifier.{max_moves, max_rounds, rearrange_interval_s}`.
+- `simulation.level` -- `graph | flow | packet` (packet requires `k <= 8`);
+  `packet.*` -- `mtu_bytes, queue_size_packets, propagation_delay_us, transport
+  (udp|window), window_packets, timeout_ms, spraying, duration_ms`.
+- `link_capacity_gbps, trials, seed, output_dir`.
+
 - CLI flags override config values (e.g. `python run.py -c config/default.yaml --k 16 --link-pct 10`).
 - Validate inputs with clear errors (k odd, pct outside [0,100], unknown pattern, ...).
 - Every random choice is seeded; trial t uses seed + t.
@@ -157,18 +167,24 @@ Each metric needs a test or an analytic sanity check (closed form, or brute forc
     user before changing approach.
 
 ## 8. Phases
-**Phase 1, due 22/10 08:00 (initial code + README):**
+**Phase 1, due 22/10 08:00 (initial code + README): done.**
 1. `fattree/` package with topology, failures (link + switch), config loading, run.py CLI.
 2. tests for topology facts (§5) and failure counts / determinism.
 3. README skeleton: overview, paper reference, parameters table, install + run commands,
    planned metrics, AI usage reference.
 4. Push to GitHub.
 
-**Phase 2, due 25/10 12:00 (full):**
-5. traffic.py + routing.py + full metrics.py.
-6. run sweeps from config/experiments, analysis.py, visualize.py, commit results + figures.
-7. README results section: for each plot, setup/parameters + discussion and significance.
-8. web/ site + GitHub Pages workflow.
+**Phase 2, due 25/10 12:00 (full): partial, see PHASE2_PROMPT.md and README.md
+"Not done / future work" for the exact gap.**
+5. ✅ traffic.py + routing/ (5 schemes) + metrics.py's one experiment-driving metric
+   (the rest of §6 is covered by fattree/sim/graph.py instead of metrics.py).
+6. ✅ (4/9 experiments) analysis.py subcommands + visualize.py plots, results/figures
+   committed. ⬜ `config/experiments/*.yaml` not used (CLI flags instead, see README);
+   5 of 9 PHASE2_PROMPT.md Step 5 experiments not run (collisions_vs_k,
+   scheduler_cost_vs_k, mice_vs_elephants, reordering_spraying_vs_hashing, incast).
+7. ✅ README results section for the 4 experiments run: setup/parameters + discussion
+   and significance each.
+8. ⬜ web/ site + GitHub Pages workflow -- not started.
 
 ## 9. Conventions
 - Python 3.10+, networkx, numpy, matplotlib, pyyaml, pytest (pin in requirements.txt).

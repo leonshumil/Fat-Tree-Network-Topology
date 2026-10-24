@@ -9,6 +9,31 @@ from fattree.topology import build_fat_tree
 from fattree.traffic import Flow, generate_traffic
 
 
+# --- links are full-duplex: opposite-direction flows must not falsely contend --------------------------------------------------------------------
+
+def test_opposite_direction_flows_on_same_physical_link_do_not_contend():
+    # A chain src -> mid -> dst: one flow src->mid, another mid->dst. They share
+    # the physical link (src,mid)/(mid,src)... no, (mid,dst) uses a different
+    # pair of nodes than (src,mid), so instead test the real failure case
+    # directly: two flows that use the SAME two nodes but in OPPOSITE
+    # directions (A->B and B->A) must each get full capacity, not half.
+    k = 8
+    g = build_fat_tree(k)
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["topology"]["k"] = k
+    cfg["routing"] = "single-path"
+    router = get_router("single-path", g, cfg)
+    hosts = [n for n, d in g.nodes(data=True) if d["type"] == "host"]
+    a, b = hosts[0], hosts[1]  # under the same edge switch: path is a-edge-b (2 hops)
+
+    flow_ab = Flow(a, b, 1000, 0.0, "mouse")
+    flow_ba = Flow(b, a, 1000, 0.0, "mouse")
+    result = simulate_flows(router, [flow_ab, flow_ba], link_capacity_gbps=1.0, load=1.0)
+    # full duplex: both directions should achieve full rate, not 0.5 each
+    assert result["rates"][0] == pytest.approx(1.0)
+    assert result["rates"][1] == pytest.approx(1.0)
+
+
 # --- max_min_fair_rates: textbook scenarios --------------------------------------------------------------------
 
 def test_single_bottleneck_splits_equally():

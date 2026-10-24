@@ -179,6 +179,139 @@ def plot_switches_multifail(rows, p_pct, out_path):
     return out_path
 
 
+def plot_critical_failure_pct(rows, out_path):
+    """Line plot: smallest link failure %% (bernoulli) that drops mean host-pair
+    connectivity below 99.9%% / 99%%, vs. switch port count k."""
+    ks = [r["k"] for r in rows]
+    p999 = [r["critical_pct_99_9"] for r in rows]
+    p99 = [r["critical_pct_99"] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(ks, p999, "o-", color="#2a6f97", label="connectivity drops below 99.9%")
+    ax.plot(ks, p99, "s-", color="#52b69a", label="connectivity drops below 99%")
+    ax.set_xlabel("switch port count k")
+    ax.set_ylabel("critical link failure %")
+    ax.set_title("Critical link failure % vs. k (bernoulli, edge-agg + agg-core)")
+    ax.legend(frameon=False, fontsize=9)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_table2(rows, patterns, paper_table2, out_path):
+    """Grouped bar chart: throughput %% of ideal, one group per pattern, one bar
+    per scheme, with the paper's own Table 2 values overlaid as markers."""
+    schemes = ["tree", "two-level", "classifier", "scheduler"]
+    colors = {"tree": "#8d99ae", "two-level": "#2a6f97", "classifier": "#52b69a", "scheduler": "#d00000"}
+    pattern_names = [name for name, _ in patterns]
+    n_patterns = len(pattern_names)
+    n_schemes = len(schemes)
+    width = 0.8 / n_schemes
+
+    by_scheme = {s: {r["pattern"]: r for r in rows if r["scheme"] == s} for s in schemes}
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    x = range(n_patterns)
+    for i, scheme in enumerate(schemes):
+        means = [by_scheme[scheme][p]["mean_pct"] for p in pattern_names]
+        cis = [by_scheme[scheme][p]["ci95"] for p in pattern_names]
+        offsets = [xi + (i - (n_schemes - 1) / 2) * width for xi in x]
+        ax.bar(offsets, means, width, yerr=cis, capsize=2, color=colors[scheme], label=scheme)
+        paper_vals = paper_table2[scheme]
+        ax.scatter(offsets, paper_vals, marker="_", color="black", s=200, linewidths=1.5,
+                   label="paper value" if i == 0 else None, zorder=3)
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(pattern_names, rotation=30, ha="right")
+    ax.set_ylabel("throughput (% of ideal)")
+    ax.set_ylim(0, 110)
+    ax.set_title("Table 2 reproduction: throughput vs. traffic pattern, by routing scheme\n"
+                 "(bars = our flow-level simulation, black ticks = paper's reported values)")
+    ax.legend(frameon=False, fontsize=8, ncol=5, loc="upper center", bbox_to_anchor=(0.5, -0.25))
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_throughput_vs_failures(rows, ks, schemes, out_path):
+    """Line plots with 95% CI bands: throughput %% of ideal vs. link failure %%,
+    one curve per routing scheme, one subplot per k."""
+    colors = {
+        "two-level": "#2a6f97", "two-level-failover": "#52b69a",
+        "ecmp": "#f4a259", "classifier": "#8d99ae", "scheduler": "#d00000",
+    }
+    fig, axes = plt.subplots(1, len(ks), figsize=(6 * len(ks), 5), squeeze=False)
+    axes = axes[0]
+
+    for ax, k in zip(axes, ks):
+        k_rows = [r for r in rows if r["k"] == k]
+        for scheme in schemes:
+            scheme_rows = sorted((r for r in k_rows if r["scheme"] == scheme), key=lambda r: r["link_pct"])
+            if not scheme_rows:
+                continue
+            pcts = [r["link_pct"] for r in scheme_rows]
+            means = [r["mean_pct"] for r in scheme_rows]
+            cis = [r["ci95"] for r in scheme_rows]
+            ax.errorbar(pcts, means, yerr=cis, fmt="o-", capsize=2, color=colors.get(scheme), label=scheme)
+        ax.set_xlabel("link failure %")
+        ax.set_ylabel("throughput (% of ideal)")
+        ax.set_title(f"k={k}")
+        ax.set_ylim(0, 105)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+    axes[0].legend(frameon=False, fontsize=8)
+    fig.suptitle("Throughput vs. link failure %, by routing scheme")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_link_vs_switch_failures(rows, pcts, out_path):
+    """Two line plots (connectivity, path diversity) vs. failure %%, one curve
+    each for link failures and switch failures at the same %%."""
+    colors = {"link": "#2a6f97", "switch": "#d00000"}
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    for failure_type in ("link", "switch"):
+        type_rows = sorted((r for r in rows if r["failure_type"] == failure_type), key=lambda r: r["pct"])
+        p = [r["pct"] for r in type_rows]
+        fc = [r["fraction_connected_mean"] for r in type_rows]
+        fc_ci = [r["fraction_connected_ci95"] for r in type_rows]
+        pd = [r["path_diversity_mean"] for r in type_rows]
+        pd_ci = [r["path_diversity_ci95"] for r in type_rows]
+        ax1.errorbar(p, fc, yerr=fc_ci, fmt="o-", capsize=2, color=colors[failure_type],
+                     label=f"{failure_type} failures")
+        ax2.errorbar(p, pd, yerr=pd_ci, fmt="o-", capsize=2, color=colors[failure_type],
+                     label=f"{failure_type} failures")
+
+    ax1.set_xlabel("failure %")
+    ax1.set_ylabel("fraction of host pairs connected")
+    ax1.set_title("Connectivity")
+    ax2.set_xlabel("failure %")
+    ax2.set_ylabel("surviving paths / (k/2)²")
+    ax2.set_title("Inter-pod path diversity (pods 0,1)")
+    for ax in (ax1, ax2):
+        ax.legend(frameon=False, fontsize=9)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+    fig.suptitle("Link failures vs. switch failures at equal %")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Draw a fat-tree topology diagram")
     p.add_argument("-c", "--config", default=None, help="path to YAML config")

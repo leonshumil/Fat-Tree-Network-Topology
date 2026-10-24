@@ -74,7 +74,15 @@ def simulate_flows(router, flows, link_capacity_gbps, load):
         if path is None:
             dropped.append(idx)
             continue
-        flow_links[idx] = [frozenset(e) for e in zip(path, path[1:])]
+        # Directed (u, v) tuples, NOT frozenset(u, v): real links are full-duplex
+        # with independent capacity per direction. Treating a link as undirected
+        # here made unrelated opposite-direction flows (e.g. a chain pattern
+        # where host B both receives from A and sends to C through the same
+        # physical link) falsely contend for one shared capacity, capping
+        # throughput at ~50% across many patterns -- caught by the paper's own
+        # Table 2 reproduction (analysis.py table2) showing an implausible flat
+        # 50% ceiling on almost every pattern/scheme combination.
+        flow_links[idx] = list(zip(path, path[1:]))
 
     demands = {idx: load * link_capacity_gbps for idx in flow_links}
     rates = max_min_fair_rates(flow_links, demands, link_capacity_gbps)
