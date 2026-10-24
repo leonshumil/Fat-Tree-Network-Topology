@@ -22,10 +22,15 @@ from fattree.metrics import simulate_multifail_vs_k
 from fattree.routing import get_router
 from fattree.sim.flow import simulate_flows
 from fattree.sim.graph import connectivity_and_path_metrics, path_diversity
-from fattree.topology import build_fat_tree, build_traditional_tree
-from fattree.traffic import generate_traffic
+from fattree.sim.packet import PacketSimulator
+from fattree.topology import build_fat_tree, build_traditional_tree, hosts_of
+from fattree.traffic import Flow, generate_pairs, generate_traffic
 from visualize import (
     plot_critical_failure_pct,
+    plot_incast_drop_location,
+    plot_incast_goodput_vs_m,
+    plot_incast_queue_series,
+    plot_incast_timeouts_vs_m,
     plot_link_vs_switch_failures,
     plot_switches_multifail,
     plot_table2,
@@ -279,6 +284,169 @@ def cmd_link_vs_switch(args):
     print(f"wrote {plot_link_vs_switch_failures(rows, args.pcts, args.plot)}")
 
 
+# --- incast (Experiment 9, PHASE3_2_EXP9_INCAST.md) --------------------------------------------------------------------
+
+def _run_incast_rounds(g, router, cfg, m, rounds, seed):
+    """Run `rounds` sequential, barrier-synchronized incast rounds: round r+1's
+    M requests start only once round r's M responses have all finished (or the
+    round's own packet.duration_ms budget runs out, to bound collapse cases).
+    Each round is simulated as an independent flow set with fresh TCP/queue
+    state (not one continuous connection reused across rounds) -- a reasonable
+    model for short-lived RPC-style incast request/response bursts, the
+    classic incast benchmark setup.
+
+    Returns aggregate goodput, drop locations, timeouts, and round-time stats.
+    """
+    cfg = copy.deepcopy(cfg)
+    cfg["traffic"]["pattern"] = "incast"
+    cfg["traffic"]["incast_senders"] = m
+    block_bytes = cfg["incast"]["block_bytes"]
+    mtu = cfg["packet"]["mtu_bytes"]
+    receiver = cfg["incast"].get("receiver") or hosts_of(g)[0]
+    receiver_edge = next((n for n in g.neighbors(receiver) if g.nodes[n]["type"] == "edge"), None)
+
+    total_bytes = 0
+    total_time_ns = 0
+    total_timeouts = 0
+    total_fast_retx = 0
+    drops_by_layer = {"host": 0, "edge": 0, "agg": 0, "core": 0}
+    receiver_drops = 0
+    max_receiver_queue = 0
+    round_times_ns = []
+    receiver_queue_series = None  # (time_ns, len) samples for one representative round
+
+    for r in range(rounds):
+        pairs = generate_pairs(g, cfg, seed=seed + r)
+        flows = [Flow(src, dst, block_bytes, 0.0, "mouse") for src, dst in pairs]
+        sim = PacketSimulator(g, router, flows, cfg)
+        result = sim.run()
+
+        finished = [fs.fct_ns() for fs in result["flow_stats"].values() if fs.fct_ns() is not None]
+        round_time_ns = max(finished) if finished else sim.duration_ns
+        round_times_ns.append(round_time_ns)
+        total_time_ns += round_time_ns
+
+        for idx, fs in result["flow_stats"].items():
+            total_timeouts += fs.timeout_count
+            total_fast_retx += fs.fast_retransmit_count
+            if fs.fct_ns() is not None:
+                total_bytes += fs.size_bytes
+            elif idx in sim.receivers:
+                total_bytes += min(fs.size_bytes, sim.receivers[idx].expected_seq * mtu)
+
+        for (u, v), ps in result["port_stats"].items():
+            if ps.drops <= 0:
+                continue
+            layer = g.nodes[v]["type"] if g.has_node(v) else "host"
+            drops_by_layer[layer] = drops_by_layer.get(layer, 0) + ps.drops
+            if v == receiver:
+                receiver_drops += ps.drops
+
+        if receiver_edge is not None:
+            key = (receiver_edge, receiver)
+            if key in result["port_stats"]:
+                max_receiver_queue = max(max_receiver_queue, result["port_stats"][key].max_queue_len())
+                if r == rounds // 2:
+                    receiver_queue_series = list(result["port_stats"][key].queue_len_samples)
+
+    round_times_ns.sort()
+    p99_round_ns = round_times_ns[min(len(round_times_ns) - 1, int(round(0.99 * (len(round_times_ns) - 1))))]
+
+    return {
+        "goodput_bps": (total_bytes * 8 / (total_time_ns / 1e9)) if total_time_ns else 0.0,
+        "total_bytes": total_bytes,
+        "timeouts_per_round": total_timeouts / rounds,
+        "fast_retx_per_round": total_fast_retx / rounds,
+        "drops_by_layer": drops_by_layer,
+        "receiver_drops": receiver_drops,
+        "max_receiver_queue": max_receiver_queue,
+        "mean_round_time_ns": sum(round_times_ns) / len(round_times_ns),
+        "p99_round_time_ns": p99_round_ns,
+        "receiver_queue_series": receiver_queue_series,
+    }
+
+
+def cmd_incast(args):
+    k = args.k
+    g = build_fat_tree(k)
+    g_tree = build_traditional_tree(k)
+
+    base_cfg = copy.deepcopy(DEFAULTS)
+    base_cfg["topology"]["k"] = k
+    base_cfg["routing"] = "two-level"
+    base_cfg["packet"]["transport"] = "tcp_lite"
+    base_cfg["packet"]["duration_ms"] = args.duration_ms
+    base_cfg["incast"]["block_bytes"] = args.block_bytes
+    receiver_link_gbps = base_cfg["link_capacity_gbps"]
+
+    all_rows = []
+
+    def sweep(label, topology_name, g_use, queue_size, min_rto_ms, csv_suffix):
+        router_name = "two-level" if topology_name == "fat-tree" else "single-path"
+        rows = []
+        for m in args.ms:
+            goodputs = []
+            extra = None
+            for t in range(args.trials):
+                cfg = copy.deepcopy(base_cfg)
+                cfg["packet"]["queue_size_packets"] = queue_size
+                cfg["packet"]["min_rto_ms"] = min_rto_ms
+                router = get_router(router_name, g_use, cfg)
+                stats = _run_incast_rounds(g_use, router, cfg, m, args.rounds, seed=args.seed + t * 1000)
+                goodputs.append(stats["goodput_bps"])
+                extra = stats  # keep the last trial's detail for drop/queue figures
+            mean, ci95 = _mean_ci95(goodputs)
+            row = {
+                "label": label, "topology": topology_name, "queue_size_packets": queue_size,
+                "min_rto_ms": min_rto_ms, "m": m,
+                "goodput_pct_of_line_rate": 100 * mean / receiver_link_gbps / 1e9,
+                "goodput_ci95_pct": 100 * ci95 / receiver_link_gbps / 1e9,
+                "timeouts_per_round": extra["timeouts_per_round"],
+                "receiver_drops": extra["receiver_drops"],
+                "max_receiver_queue": extra["max_receiver_queue"],
+                "p99_round_time_ms": extra["p99_round_time_ns"] / 1e6,
+            }
+            row["_drops_by_layer"] = extra["drops_by_layer"]
+            row["_queue_series"] = extra["receiver_queue_series"]
+            rows.append(row)
+            print(f"{label:<22} M={m:>3}  goodput={row['goodput_pct_of_line_rate']:5.1f}% "
+                  f"(+/-{row['goodput_ci95_pct']:.1f})  timeouts/round={row['timeouts_per_round']:.2f}  "
+                  f"recv_drops={row['receiver_drops']}")
+        return rows
+
+    # Figure 1: goodput vs M, one curve per buffer size (min RTO 200ms, fat-tree)
+    buffer_rows = []
+    for q in args.queue_sizes:
+        buffer_rows += sweep(f"buffer={q}", "fat-tree", g, q, 200, "buffer")
+    all_rows += buffer_rows
+
+    # Figure 2: goodput vs M, min RTO 200ms vs 1ms (buffer = args.queue_sizes[-1])
+    rto_q = args.queue_sizes[len(args.queue_sizes) // 2]
+    rto_rows = []
+    for rto in [200, 1]:
+        rto_rows += sweep(f"min_rto_ms={rto}", "fat-tree", g, rto_q, rto, "rto")
+    all_rows += rto_rows
+
+    # Figure 3 (+4): goodput vs M, fat-tree vs traditional tree (buffer=rto_q, min RTO 200ms)
+    topo_rows = []
+    topo_rows += sweep("fat-tree", "fat-tree", g, rto_q, 200, "topo")
+    topo_rows += sweep("traditional-tree", "traditional-tree", g_tree, rto_q, 200, "topo")
+    all_rows += topo_rows
+
+    csv_rows = [{key: v for key, v in row.items() if not key.startswith("_")} for row in all_rows]
+    _write_csv(args.csv, csv_rows)
+
+    print(f"wrote {plot_incast_goodput_vs_m(buffer_rows, 'queue_size_packets', 'buffer', args.plot_buffer)}")
+    print(f"wrote {plot_incast_goodput_vs_m(rto_rows, 'min_rto_ms', 'min RTO (ms)', args.plot_rto)}")
+    print(f"wrote {plot_incast_goodput_vs_m(topo_rows, 'topology', 'topology', args.plot_topo)}")
+    print(f"wrote {plot_incast_drop_location(topo_rows, args.plot_drops)}")
+    print(f"wrote {plot_incast_timeouts_vs_m(buffer_rows, args.plot_timeouts)}")
+
+    series_row = next((r for r in topo_rows if r["topology"] == "fat-tree" and r["m"] == args.ms[-1]), None)
+    if series_row and series_row["_queue_series"]:
+        print(f"wrote {plot_incast_queue_series(series_row['_queue_series'], args.ms[-1], args.plot_queue)}")
+
+
 # --- CLI --------------------------------------------------------------------
 
 def main():
@@ -329,6 +497,24 @@ def main():
     p5.add_argument("--csv", default="results/link_vs_switch_failures.csv")
     p5.add_argument("--plot", default="figures/link_vs_switch_failures.png")
     p5.set_defaults(func=cmd_link_vs_switch)
+
+    p6 = sub.add_parser("incast", help="Experiment 9: incast goodput collapse vs number of senders M")
+    p6.add_argument("--k", type=int, default=4)
+    p6.add_argument("--ms", type=int, nargs="+", default=[1, 2, 4, 8, 15])
+    p6.add_argument("--queue-sizes", type=int, nargs="+", default=[32, 64, 128])
+    p6.add_argument("--rounds", type=int, default=10)
+    p6.add_argument("--trials", type=int, default=5)
+    p6.add_argument("--seed", type=int, default=1)
+    p6.add_argument("--block-bytes", type=int, default=65_536)
+    p6.add_argument("--duration-ms", type=float, default=3000)
+    p6.add_argument("--csv", default="results/incast.csv")
+    p6.add_argument("--plot-buffer", default="figures/incast_goodput_vs_m_buffer.png")
+    p6.add_argument("--plot-rto", default="figures/incast_goodput_vs_m_rto.png")
+    p6.add_argument("--plot-topo", default="figures/incast_goodput_vs_m_topology.png")
+    p6.add_argument("--plot-drops", default="figures/incast_drop_location.png")
+    p6.add_argument("--plot-timeouts", default="figures/incast_timeouts_vs_m.png")
+    p6.add_argument("--plot-queue", default="figures/incast_queue_series.png")
+    p6.set_defaults(func=cmd_incast)
 
     args = parser.parse_args()
     args.func(args)

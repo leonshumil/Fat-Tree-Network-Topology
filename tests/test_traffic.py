@@ -92,6 +92,43 @@ def test_incast_single_receiver_distinct_senders():
     assert next(iter(dsts)) not in srcs
 
 
+def test_incast_default_receiver_is_first_host_of_pod_0():
+    g = build_fat_tree(8)
+    pairs = generate_pairs(g, _cfg(pattern="incast", incast_senders=4), seed=1)
+    dst = pairs[0][1]
+    assert dst == hosts_of(g)[0]
+    assert g.nodes[dst]["pod"] == 0
+
+
+def test_incast_sender_placement_other_pods():
+    g = build_fat_tree(8)
+    cfg = _cfg(pattern="incast", incast_senders=10)
+    cfg["incast"] = {"sender_placement": "other-pods"}
+    pairs = generate_pairs(g, cfg, seed=1)
+    dst_pod = g.nodes[pairs[0][1]]["pod"]
+    for src, _ in pairs:
+        assert g.nodes[src]["pod"] != dst_pod
+
+
+def test_incast_sender_placement_same_pod():
+    g = build_fat_tree(8)
+    cfg = _cfg(pattern="incast", incast_senders=4)
+    cfg["incast"] = {"sender_placement": "same-pod"}
+    pairs = generate_pairs(g, cfg, seed=1)
+    dst_pod = g.nodes[pairs[0][1]]["pod"]
+    for src, _ in pairs:
+        assert g.nodes[src]["pod"] == dst_pod
+
+
+def test_incast_explicit_receiver_honored():
+    g = build_fat_tree(8)
+    explicit_receiver = hosts_of(g)[5]
+    cfg = _cfg(pattern="incast", incast_senders=4)
+    cfg["incast"] = {"receiver": explicit_receiver}
+    pairs = generate_pairs(g, cfg, seed=1)
+    assert all(d == explicit_receiver for _, d in pairs)
+
+
 # --- staggered --------------------------------------------------------------------
 
 def test_staggered_subnet_p_1_always_same_edge_switch():

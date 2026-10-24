@@ -312,6 +312,104 @@ def plot_link_vs_switch_failures(rows, pcts, out_path):
     return out_path
 
 
+def plot_incast_goodput_vs_m(rows, group_key, group_label, out_path):
+    """Line plot: incast goodput (% of receiver line rate) vs. number of
+    senders M, one curve per distinct value of `group_key` (the "collapse"
+    figure -- PHASE3_2_EXP9_INCAST.md figures 1-3)."""
+    groups = sorted({row[group_key] for row in rows}, key=str)
+    colors = plt.cm.viridis([i / max(1, len(groups) - 1) for i in range(len(groups))])
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for color, group in zip(colors, groups):
+        group_rows = sorted((r for r in rows if r[group_key] == group), key=lambda r: r["m"])
+        ms = [r["m"] for r in group_rows]
+        means = [r["goodput_pct_of_line_rate"] for r in group_rows]
+        cis = [r["goodput_ci95_pct"] for r in group_rows]
+        ax.errorbar(ms, means, yerr=cis, fmt="o-", capsize=3, color=color, label=f"{group_label}={group}")
+    ax.set_xlabel("number of senders M")
+    ax.set_ylabel("goodput (% of receiver line rate)")
+    ax.set_ylim(0, 105)
+    ax.set_title(f"Incast goodput vs. M, by {group_label}")
+    ax.legend(frameon=False, fontsize=9)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_incast_drop_location(topo_rows, out_path):
+    """Pie charts (side by side): where incast packets are dropped (by layer),
+    fat-tree vs. traditional tree, at the largest M in `topo_rows`."""
+    topologies = sorted({row["topology"] for row in topo_rows})
+    fig, axes = plt.subplots(1, len(topologies), figsize=(6 * len(topologies), 5))
+    if len(topologies) == 1:
+        axes = [axes]
+    colors = {"host": "#d00000", "edge": "#f4a259", "agg": "#52b69a", "core": "#2a6f97"}
+
+    for ax, topo in zip(axes, topologies):
+        topo_group = [r for r in topo_rows if r["topology"] == topo]
+        row = max(topo_group, key=lambda r: r["m"])
+        drops = row["_drops_by_layer"]
+        labels = [k for k, v in drops.items() if v > 0]
+        values = [v for v in drops.values() if v > 0]
+        if values:
+            ax.pie(values, labels=labels, colors=[colors.get(l, "#999") for l in labels],
+                   autopct="%1.0f%%", startangle=90)
+        else:
+            ax.text(0.5, 0.5, "no drops", ha="center", va="center", transform=ax.transAxes)
+        ax.set_title(f"{topo} (M={row['m']})")
+    fig.suptitle("Where incast packets are dropped, by layer")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_incast_timeouts_vs_m(rows, out_path):
+    """Line plot: RTO timeouts per round vs. M, one curve per buffer size."""
+    groups = sorted({row["queue_size_packets"] for row in rows})
+    colors = plt.cm.viridis([i / max(1, len(groups) - 1) for i in range(len(groups))])
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for color, q in zip(colors, groups):
+        group_rows = sorted((r for r in rows if r["queue_size_packets"] == q), key=lambda r: r["m"])
+        ax.plot([r["m"] for r in group_rows], [r["timeouts_per_round"] for r in group_rows],
+                "o-", color=color, label=f"buffer={q}")
+    ax.set_xlabel("number of senders M")
+    ax.set_ylabel("RTO timeouts per round")
+    ax.set_title("Incast timeouts vs. M, by buffer size")
+    ax.legend(frameon=False, fontsize=9)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_incast_queue_series(samples, m, out_path):
+    """Queue length at the receiver's edge port over time, for one round."""
+    fig, ax = plt.subplots(figsize=(8, 4))
+    times_ms = [t / 1e6 for t, _ in samples]
+    lens = [n for _, n in samples]
+    ax.step(times_ms, lens, where="post", color="#2a6f97")
+    ax.set_xlabel("time (ms)")
+    ax.set_ylabel("queue length (packets)")
+    ax.set_title(f"Receiver edge-port queue length over one round, M={m}")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Draw a fat-tree topology diagram")
     p.add_argument("-c", "--config", default=None, help="path to YAML config")

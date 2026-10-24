@@ -103,10 +103,28 @@ def _pattern_all_to_all(g, hosts, cfg, rng):
 
 
 def _pattern_incast(g, hosts, cfg, rng):
+    """M senders -> 1 receiver (PHASE3_2_EXP9_INCAST.md). `incast.receiver`
+    defaults to the first host of pod 0 (`hosts[0]`, since hosts_of() sorts by
+    (pod, switch, host_id)); `incast.sender_placement` controls which hosts are
+    eligible senders: other-pods (default, the classic incast setup) | same-pod
+    | random (any host)."""
+    incast_cfg = cfg.get("incast", {})
     m = cfg["traffic"].get("incast_senders", 8)
-    m = min(m, len(hosts) - 1)
-    dst = rng.choice(hosts)
-    senders = rng.sample([h for h in hosts if h != dst], m)
+
+    dst = incast_cfg.get("receiver") or hosts[0]
+    dst_pod = g.nodes[dst]["pod"]
+    placement = incast_cfg.get("sender_placement", "other-pods")
+    if placement == "other-pods":
+        candidates = [h for h in hosts if h != dst and g.nodes[h]["pod"] != dst_pod]
+    elif placement == "same-pod":
+        candidates = [h for h in hosts if h != dst and g.nodes[h]["pod"] == dst_pod]
+    elif placement == "random":
+        candidates = [h for h in hosts if h != dst]
+    else:
+        raise ValueError(f"unknown incast.sender_placement: {placement!r}")
+
+    m = min(m, len(candidates))
+    senders = rng.sample(candidates, m)
     return [(src, dst) for src in senders]
 
 

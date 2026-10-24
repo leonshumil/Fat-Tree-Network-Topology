@@ -39,9 +39,11 @@ fattree/
   traffic.py     # 8 traffic patterns (paper Sec. 5.2) + flow-size/class models
   routing/       # single-path, ecmp, two-level (paper Alg. 1/2), classifier (Alg. 3), scheduler
   sim/
-    graph.py     # structure-only connectivity/path metrics (edge-switch aggregation trick)
-    flow.py      # max-min fair rate allocation (progressive filling)
-    packet.py    # discrete-event packet simulator, k <= 8 only
+    graph.py          # structure-only connectivity/path metrics (edge-switch aggregation trick)
+    flow.py           # max-min fair rate allocation (progressive filling)
+    packet.py         # discrete-event packet simulator engine, k <= 8 only
+    transport.py       # udp (open-loop) and tcp_lite (Reno-like, RFC 6298 RTO) state machines
+    packet_metrics.py  # per-packet/flow/port stats, RFC 4737 reordering
 config/
   default.yaml   # one scenario
 run.py           # CLI: build a topology, apply failures, print a summary
@@ -149,14 +151,16 @@ time with a Python discrete-event loop:
   perfectly and instantly, with no buildup or loss. Used for `table2_reproduction`
   and `throughput_vs_failures`. Limitation: cannot show queueing delay, drops,
   or reordering.
-- **packet** — genuine discrete-event simulation (FIFO drop-tail queues,
-  store-and-forward, UDP or simple ACK/window transport), restricted to `k ≤ 8`
-  since it is the slowest engine by orders of magnitude. The right tool for
-  queueing/drop/reordering/FCT questions — not used in this submission's 4
-  highlighted experiments, but exercised directly by `tests/test_sim_packet.py`
-  (see [Not done / future work](#not-done--future-work) for the packet-level
-  experiments that were designed but not run under the deadline). Limitation:
-  no congestion control beyond a fixed window, no multi-flow TCP fairness.
+- **packet** — genuine discrete-event simulation, integer-nanosecond clock
+  (FIFO drop-tail queues, store-and-forward, `udp` open-loop or `tcp_lite`
+  Reno-like reliable transport with RFC 6298 RTO), restricted to `k ≤ 8` since
+  it is the slowest engine by orders of magnitude. The right tool for
+  queueing/drop/reordering/FCT/timeout questions — used for
+  [Experiment 9 (Incast)](#experiment-9-incast) below, and exercised directly
+  by `tests/test_packet_sim.py`'s 13 required validation tests (exact delay
+  formulas, queue-overflow drop counts, an M/D/1 queueing-theory check,
+  reordering under spraying, etc.). Limitation: no SACK, no delayed ACKs, no
+  ECN, simplified fast recovery (see the Incast results for how this shows up).
 
 ## Input parameters
 
@@ -217,6 +221,7 @@ python analysis.py critical-failure-pct --ks 4 8 16 24 32 --trials 10
 python analysis.py table2 --k 4 --trials 15
 python analysis.py throughput-vs-failures --ks 8 16 --pcts 0 5 10 15 20 25 30 --trials 15
 python analysis.py link-vs-switch --k 16 --pcts 0 1 2 5 10 15 20 --trials 15
+python analysis.py incast --k 4 --ms 1 2 4 8 15 --queue-sizes 32 64 128 --rounds 10 --trials 5
 ```
 
 Example output:
@@ -251,7 +256,7 @@ example); and all three simulation levels, including `fattree/sim/graph.py`'s
 metrics against brute-force host-pair BFS across several `k`/failure
 combinations, `fattree/sim/flow.py`'s max-min fairness against the classic
 asymmetric-bottleneck textbook example, and `fattree/sim/packet.py`'s exact
-delay/drop/reorder/retransmission properties (see Results below). 180 tests,
+delay/drop/reorder/retransmission properties (see Results below). 185 tests,
 all passing.
 
 ## Results
@@ -458,12 +463,107 @@ have no exotic hotspot structure — do land close to the paper's values
 underlying routing/capacity model is sound and the divergence on the
 worst-case patterns is a modeling-fidelity gap, not a correctness bug.
 
+### Experiment 9: Incast
+
+**Incast in plain words.** A partition/aggregate query (e.g. a search front-end
+fanning a request out to many backend shards) gets M near-simultaneous
+responses converging on one requester. Even though the fat-tree has full
+bisection bandwidth between *any* two pods, that says nothing about the
+*last* hop: M senders all funnel into the *same* single link into the
+receiver's edge switch, which has only one port's worth of capacity (and
+buffer) regardless of how rich the core is. When M responses arrive close
+together, that one port's queue overflows, TCP loses packets, and with a
+RFC 6298-style minimum RTO of 200ms — while the actual round trip on this
+network is tens of *microseconds* — goodput collapses while the sender waits
+out a timeout that's 1000x longer than it needs to be. This directly extends
+the bisection-bandwidth story from [Critical link failure %](#critical-link-failure--vs-switch-port-count)
+and [Table 2](#table-2-reproduction-paper-sec-5-table-2) above: bisection
+bandwidth is a *network-wide* property, but incast is a *single-port*
+pathology that no amount of core capacity fixes.
+
+**Setup.** `k=4`, `transport: tcp_lite`, barrier-synchronized rounds (round
+r+1's M requests start once round r's M responses all finish; each round
+simulated independently -- fresh TCP/queue state per round, approximating
+short-lived RPC-style bursts rather than one sustained connection reused
+across rounds). `block_bytes = 64 KB` per sender per round, `rounds = 10`
+(reduced from the planned 20 for time; 5 trials per point, mean ± 95% CI).
+`M ∈ {1, 2, 4, 8, 15}` (15 = all other hosts in pod 0 at k=4).
+
+Reproduce: `python analysis.py incast --k 4 --ms 1 2 4 8 15 --queue-sizes 32 64 128 --rounds 10 --trials 5`
+→ `results/incast.csv` + the figures below.
+
+![Incast goodput collapse vs. M, one curve per receiver buffer size: the classic incast cliff, shifting right as the buffer grows](figures/incast_goodput_vs_m_buffer.png)
+
+**Discussion (buffer size).** This is the textbook incast collapse curve.
+With a 32-packet buffer, goodput craters from 87.5% (M=1) to 0.5% the moment
+a *second* sender appears. A 64-packet buffer survives M=2 (93.3%) but still
+collapses at M=4 (1.7%). A 128-packet buffer survives all the way to M=4
+(96.5%) before collapsing at M=8 (0.6%). The buffer size doesn't prevent
+collapse, it only moves the cliff to a larger M — exactly the expected
+result, and a direct, quantitative illustration of why real incast mitigation
+(DCTCP-style ECN marking, smaller RTO, or application-level request pacing)
+targets the *loss-then-200ms-timeout* mechanism rather than just buying more
+buffer, since buffer alone only delays the problem.
+
+![Incast goodput vs. M, min RTO 200ms vs 1ms](figures/incast_goodput_vs_m_rto.png)
+
+**Discussion (min RTO).** At M=4, dropping the minimum RTO from 200ms to 1ms
+raises mean goodput from 1.7% to 47.3% (though with high variance, ±36 points
+— some trials still collapse, some recover almost fully, since whether a
+retry lands before or after the queue drains is itself timing-sensitive at
+this scale); at M=15, 1ms goodput (9.7%) is still roughly 50x the 200ms case
+(0.2%). This is a direct, quantitative reproduction of Vasudevan et al.'s
+(SIGCOMM 2009) central claim: the 200ms RTO floor is a vestige of wide-area
+TCP defaults and is wildly mismatched to a sub-millisecond datacenter RTT —
+most of the collapse is a timer problem, not a capacity problem.
+
+![Incast goodput vs. M: fat-tree vs. traditional tree](figures/incast_goodput_vs_m_topology.png)
+
+![Where incast packets are dropped, by layer: fat-tree vs. traditional tree, at M=15](figures/incast_drop_location.png)
+
+**Discussion (topology).** Fat-tree and traditional-tree collapse at
+essentially the same M (both already struggling by M=4), confirming the
+plain-words framing above: the fat-tree's richer core does *not* solve
+incast, because the bottleneck was never the core. The drop-location pie
+charts show *why* the two topologies fail for related but distinct reasons:
+in the fat-tree, 84% of drops are at the receiver's own last-hop port (the
+only possible bottleneck in a non-oversubscribed fabric) and 16% spill onto
+an agg link; in the traditional tree, 100% of drops are at the single
+oversubscribed agg-to-core link, since that tree's structural oversubscription
+(every pod funneled through one core switch, see
+[Traditional tree](#traditional-tree-comparison-baseline) above) adds a
+*second* bottleneck on top of the universal last-hop one.
+
+![RTO timeouts per round vs. M, by buffer size](figures/incast_timeouts_vs_m.png)
+
+![Receiver edge-port queue length over one round, M=15](figures/incast_queue_series.png)
+
+**Discussion (timeouts and queue dynamics).** Timeouts per round climb
+steeply with M once past each buffer's collapse point (e.g. buffer=32: 4/round
+at M=2 rising to 36/round at M=15) — directly tracking the goodput collapse,
+confirming timeouts (not merely drops) are the proximate cause of lost
+goodput, since a dropped packet alone only costs a retransmission, while a
+*timeout* costs the full (possibly-doubled) RTO. The queue-depth trace for one
+M=15 round shows the mechanism directly: the initial burst fills the
+64-packet buffer instantly, then the queue sits almost empty with sparse
+~200ms-spaced blips — each blip is one lost flow's RTO-paced retry trickling
+in, exactly the "burst, collapse, slow trickle" pattern the collapse curves
+summarize in aggregate.
+
+**tcp_lite simplifications** (see [AI usage](#ai-usage) / Status for the full
+list): no SACK means a sender can only learn about *one* lost segment per
+round of ACKs, so recovering from the multi-packet loss bursts typical of
+incast is slower than a real SACK-based TCP; no delayed ACKs or ECN; a
+simplified fast-recovery (cwnd set directly to the new ssthresh, no inflation
+during recovery). These make the simulated collapse somewhat more severe than
+a production DCTCP/SACK-enabled stack would show, but the *qualitative*
+cliff/RTO/topology findings above are the same phenomena real incast research
+documents.
+
 ## Not done / future work
 
-`PHASE2_PROMPT.md` Step 5 specifies 9 experiments; given the submission
-deadline, the 4 above were prioritized (they best showcase the traffic/routing/
-simulation work and map directly onto the assignment's own example metrics).
-Five were designed but not run:
+`PHASE2_PROMPT.md` Step 5 and `PHASE3_*.md` specify 9 experiments total; 5 are
+done (the 4 Phase 2 experiments plus Experiment 9, Incast). Four remain:
 
 - **collisions_vs_k** — throughput lost to two-level/ECMP hash collisions vs.
   `k` (paper §5.3 predicts it shrinks as `k` grows). Mechanically similar to
@@ -474,12 +574,16 @@ Five were designed but not run:
   already records exactly this (`placements`, `mean_placement_time_s`,
   `link_state_entries`, `flow_state_entries`) — only the sweep-and-plot script
   is missing.
-- **mice_vs_elephants**, **reordering_spraying_vs_hashing**, **incast** — all
-  packet-level (`k ∈ {4, 8}`). The packet engine itself is built and tested
-  (`fattree/sim/packet.py`, `tests/test_sim_packet.py` directly demonstrates
-  FCT-by-class, spraying-induced reordering, and incast-style queue drops at a
-  receiver) — these three just need their own sweep/plot wrappers in
-  `analysis.py`, the same pattern as the 4 experiments above.
+- **Experiment 7 (mice vs. elephants)** and **Experiment 8 (reordering:
+  spraying vs. per-flow hashing)** — both packet-level (`k ∈ {4, 8}`),
+  specified in `PHASE3_1_EXP8_REORDERING.md` and `PHASE3_3_EXP7_MICE_ELEPHANTS.md`.
+  The packet engine built for Experiment 9 (`fattree/sim/packet.py`,
+  `fattree/sim/transport.py`) already supports everything both experiments
+  need (tcp_lite, spraying, FCT by class, classifier/scheduler routing) and
+  `tests/test_packet_sim.py` directly demonstrates spraying-induced reordering
+  and per-flow-hashing's lack of it — these two just need their own
+  round/sweep-and-plot wrappers in `analysis.py`, the same pattern used for
+  `incast`.
 - The `web/` GitHub Pages interactive site (`CLAUDE.md` §7) — not started.
 - `build_traditional_tree`'s oversubscription is fixed by its structure, not a
   tunable parameter (needed for an exact 3.6:1 match to the paper's Table 2
@@ -502,7 +606,7 @@ convention was reverse-engineered from the paper's own worked example, read
 directly from the PDF, and verified to reproduce it), `fattree/sim/` (all 3
 simulation engines), `visualize.py`, and `analysis.py`, all from a specification
 written by the author (see `CLAUDE.md` and `PHASE2_PROMPT.md`); and writing the
-accompanying pytest suite (180 tests), including brute-force/closed-form checks
+accompanying pytest suite (185 tests), including brute-force/closed-form checks
 of the multi-failure formula and the graph-level connectivity metrics, and the
 paper-example verification for two-level routing. Three real bugs were found
 and fixed during this process by tracing actual behavior against expectations
@@ -538,7 +642,7 @@ limitations of what *is* here:
 - **Classifier/scheduler fidelity.** Both are functional approximations of the
   paper's Algorithm 3 and Sec. 4.3 scheduler, not literal re-implementations —
   the Table 2 discussion above quantifies where this shows up.
-- **Further adversarial testing.** The test suite is substantial (180 tests)
+- **Further adversarial testing.** The test suite is substantial (185 tests)
   but has not been independently red-teamed; larger-`k` combinations of
   simultaneous link + switch failures, and packet-level edge cases beyond what
   Step 4's required properties covered, are comparatively undertested.
