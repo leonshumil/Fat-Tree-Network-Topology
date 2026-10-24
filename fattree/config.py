@@ -15,7 +15,21 @@ DEFAULTS = {
         "switch_layers": ["core", "agg", "edge"],
         "mode": "exact",
     },
-    "traffic": {"pattern": "random", "stride": 1, "load": 0.8},
+    "traffic": {
+        "pattern": "random",
+        "stride": 1,
+        "subnet_p": 0.5,
+        "pod_p": 0.3,
+        "incast_senders": 8,
+        "load": 1.0,
+        "size_model": "mice-elephants",
+        "fixed_size_bytes": 1_000_000,
+        "elephant_fraction": 0.1,
+        "elephant_size_range": [10_000_000, 1_000_000_000],
+        "mouse_size_range": [2_000, 100_000],
+        "elephant_threshold_bytes": 10_000_000,
+        "empirical_cdf": None,
+    },
     "routing": "ecmp",
     "link_capacity_gbps": 1,
     "trials": 30,
@@ -26,7 +40,11 @@ DEFAULTS = {
 VALID_TOPOLOGY_TYPES = {"fat-tree", "traditional-tree"}
 VALID_LINK_LAYERS = {"host-edge", "edge-agg", "agg-core"}
 VALID_SWITCH_LAYERS = {"core", "agg", "edge"}
-VALID_PATTERNS = {"random", "stride", "all-to-all", "incast", "same-pod", "staggered"}
+VALID_PATTERNS = {
+    "random", "stride", "all-to-all", "incast", "same-pod", "staggered",
+    "inter-pod-incoming", "same-id-outgoing",
+}
+VALID_SIZE_MODELS = {"fixed", "mice-elephants", "empirical"}
 VALID_ROUTING = {"ecmp", "two-level", "single-path"}
 VALID_MODES = {"exact", "bernoulli"}
 
@@ -105,11 +123,31 @@ def validate_config(cfg):
     if bad:
         raise ValueError(f"failures.switch_layers has unknown layers: {bad}")
 
-    if cfg["traffic"]["pattern"] not in VALID_PATTERNS:
-        raise ValueError(f"traffic.pattern must be one of {VALID_PATTERNS}, got {cfg['traffic']['pattern']!r}")
+    traffic = cfg["traffic"]
+    if traffic["pattern"] not in VALID_PATTERNS:
+        raise ValueError(f"traffic.pattern must be one of {VALID_PATTERNS}, got {traffic['pattern']!r}")
 
-    if not (0 < cfg["traffic"]["load"] <= 1):
-        raise ValueError(f"traffic.load must be in (0, 1], got {cfg['traffic']['load']!r}")
+    if not (0 < traffic["load"] <= 1):
+        raise ValueError(f"traffic.load must be in (0, 1], got {traffic['load']!r}")
+
+    size_model = traffic.get("size_model", "fixed")
+    if size_model not in VALID_SIZE_MODELS:
+        raise ValueError(f"traffic.size_model must be one of {VALID_SIZE_MODELS}, got {size_model!r}")
+    if size_model == "empirical" and not traffic.get("empirical_cdf"):
+        raise ValueError("traffic.size_model is 'empirical' but traffic.empirical_cdf is not set")
+
+    for p_key in ("subnet_p", "pod_p", "elephant_fraction"):
+        p = traffic.get(p_key)
+        if p is not None and not (0 <= p <= 1):
+            raise ValueError(f"traffic.{p_key} must be in [0, 1], got {p!r}")
+    if traffic.get("subnet_p", 0) + traffic.get("pod_p", 0) > 1:
+        raise ValueError(
+            f"traffic.subnet_p + traffic.pod_p must be <= 1, "
+            f"got {traffic.get('subnet_p', 0)} + {traffic.get('pod_p', 0)}"
+        )
+
+    if traffic.get("incast_senders", 1) < 1:
+        raise ValueError(f"traffic.incast_senders must be >= 1, got {traffic.get('incast_senders')!r}")
 
     if cfg["routing"] not in VALID_ROUTING:
         raise ValueError(f"routing must be one of {VALID_ROUTING}, got {cfg['routing']!r}")

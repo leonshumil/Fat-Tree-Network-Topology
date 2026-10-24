@@ -16,6 +16,14 @@ def validate_k(k):
         raise ValueError(f"k must be an even integer >= 4, got {k!r}")
 
 
+def hosts_of(g):
+    """Return host node names, sorted by (pod, switch, host_id) for a deterministic
+    order -- used by traffic.py's patterns (e.g. stride, index-based derangement)."""
+    hosts = [n for n, d in g.nodes(data=True) if d["type"] == "host"]
+    hosts.sort(key=lambda n: (g.nodes[n]["pod"], g.nodes[n]["switch"], g.nodes[n]["host_id"]))
+    return hosts
+
+
 def build_fat_tree(k):
     """Return a networkx.Graph for a k-ary fat-tree.
 
