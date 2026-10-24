@@ -30,7 +30,9 @@ DEFAULTS = {
         "elephant_threshold_bytes": 10_000_000,
         "empirical_cdf": None,
     },
-    "routing": "ecmp",
+    "routing": "two-level",
+    "two_level": {"failover": False},
+    "classifier": {"rearrange_interval_s": 1.0, "max_moves": 3, "max_rounds": 20},
     "link_capacity_gbps": 1,
     "trials": 30,
     "seed": 1,
@@ -45,7 +47,7 @@ VALID_PATTERNS = {
     "inter-pod-incoming", "same-id-outgoing",
 }
 VALID_SIZE_MODELS = {"fixed", "mice-elephants", "empirical"}
-VALID_ROUTING = {"ecmp", "two-level", "single-path"}
+VALID_ROUTING = {"ecmp", "two-level", "single-path", "classifier", "scheduler"}
 VALID_MODES = {"exact", "bernoulli"}
 
 

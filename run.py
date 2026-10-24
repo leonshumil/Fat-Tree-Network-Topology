@@ -28,7 +28,8 @@ def parse_args():
     p.add_argument("--mode", choices=["exact", "bernoulli"], help="failure selection mode")
     p.add_argument("--pattern", help="traffic pattern")
     p.add_argument("--load", type=float, help="offered load per host")
-    p.add_argument("--routing", choices=["ecmp", "two-level", "single-path"], help="routing scheme")
+    p.add_argument("--routing", choices=["single-path", "ecmp", "two-level", "classifier", "scheduler"],
+                    help="routing scheme")
     p.add_argument("--seed", type=int, help="random seed")
     p.add_argument("--trials", type=int, help="number of trials")
     p.add_argument("--json", action="store_true", help="print summary as JSON")

@@ -27,7 +27,13 @@ traffic:
   mouse_size_range: [2000, 100000]
   elephant_threshold_bytes: 10000000  # a flow >= this size is class "elephant"
   empirical_cdf: null            # path to a size_bytes,cdf CSV; used when size_model = empirical
-routing: ecmp                   # ecmp | two-level | single-path
+routing: two-level               # single-path | ecmp | two-level | classifier | scheduler
+two_level:
+  failover: false                # static tables don't reroute on failure unless true (paper Sec. 3.8)
+classifier:
+  rearrange_interval_s: 1.0       # paper: t = 1s
+  max_moves: 3                    # flows moved per rearrangement (Algorithm 3)
+  max_rounds: 20                  # stop early once a round moves nothing
 link_capacity_gbps: 1
 trials: 30
 seed: 1

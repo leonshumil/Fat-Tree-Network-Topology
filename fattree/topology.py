@@ -24,6 +24,19 @@ def hosts_of(g):
     return hosts
 
 
+def pod_switch_name(pod, switch, half):
+    """Node name for a pod switch, following build_fat_tree()'s naming convention
+    (switch < half -> edge, else agg). Used by fattree/routing to resolve computed
+    port numbers back to node names without re-deriving the naming scheme."""
+    kind = "edge" if switch < half else "agg"
+    return f"{kind}-p{pod}-s{switch}"
+
+
+def core_switch_name(j, i):
+    """Node name for core switch (j, i), 1-indexed as in the paper's addressing."""
+    return f"core-{j}-{i}"
+
+
 def build_fat_tree(k):
     """Return a networkx.Graph for a k-ary fat-tree.
 
