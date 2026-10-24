@@ -410,6 +410,111 @@ def plot_incast_queue_series(samples, m, out_path):
     return out_path
 
 
+SCHEME_COLORS = {
+    "single-path": "#8d99ae", "ecmp": "#f4a259", "two-level": "#2a6f97",
+    "classifier": "#52b69a", "scheduler": "#d00000",
+}
+
+
+def plot_mice_elephants_bars(bar_data, out_path, ylabel="slowdown (FCT / ideal FCT)",
+                              title="Mean slowdown by scheme, mice vs. elephants (load=0.5)", single=False):
+    """Grouped bar chart: mean slowdown per scheme, mice vs. elephants (or a
+    single series, e.g. mouse p99, when `single=True`)."""
+    schemes = [s for s in SCHEME_COLORS if s in bar_data]
+    x = range(len(schemes))
+    fig, ax = plt.subplots(figsize=(8, 5))
+    if single:
+        values = [bar_data[s][0] or 0 for s in schemes]
+        bars = ax.bar(list(x), values, color=[SCHEME_COLORS[s] for s in schemes])
+        for bar, s in zip(bars, schemes):
+            if bar_data[s][0] is None:
+                ax.text(bar.get_x() + bar.get_width() / 2, 0.02, "N/A", ha="center", va="bottom", fontsize=8)
+    else:
+        width = 0.35
+        mouse_vals = [bar_data[s][0] or 0 for s in schemes]
+        eleph_vals = [bar_data[s][1] or 0 for s in schemes]
+        ax.bar([i - width / 2 for i in x], mouse_vals, width, label="mice", color="#2a6f97")
+        bars = ax.bar([i + width / 2 for i in x], eleph_vals, width, label="elephants", color="#d00000")
+        for bar, s in zip(bars, schemes):
+            if bar_data[s][1] is None:
+                ax.text(bar.get_x() + bar.get_width() / 2, 0.02, "N/A", ha="center", va="bottom", fontsize=8)
+        ax.legend(frameon=False, fontsize=9)
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(schemes, rotation=20, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_mice_elephants_line(rows, schemes, field, ylabel, out_path):
+    """Line plot: `field` vs. load, one curve per routing scheme."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scheme in schemes:
+        scheme_rows = sorted((r for r in rows if r["scheme"] == scheme and r[field] is not None),
+                             key=lambda r: r["load"])
+        if not scheme_rows:
+            continue
+        ax.plot([r["load"] for r in scheme_rows], [r[field] for r in scheme_rows],
+                "o-", color=SCHEME_COLORS.get(scheme), label=scheme)
+    ax.set_xlabel("offered load")
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{ylabel} vs. load, by scheme")
+    ax.legend(frameon=False, fontsize=9)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_mice_elephants_mouse_fct_cdf(cdf_data, out_path):
+    """CDF of mouse FCT, one curve per scheme (load=0.7)."""
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for scheme, fcts_ns in cdf_data.items():
+        if not fcts_ns:
+            continue
+        fcts_ms = [t / 1e6 for t in fcts_ns]
+        y = [i / len(fcts_ms) for i in range(1, len(fcts_ms) + 1)]
+        ax.plot(fcts_ms, y, color=SCHEME_COLORS.get(scheme), label=scheme)
+    ax.set_xlabel("mouse FCT (ms)")
+    ax.set_ylabel("CDF")
+    ax.set_title("Mouse FCT CDF by scheme (load=0.7)")
+    ax.legend(frameon=False, fontsize=9)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_mice_elephants_bytes_pie(flow_share, byte_share, out_path):
+    """Pie charts: share of flows vs. share of bytes by class (shows "few
+    elephants, most bytes")."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+    colors = {"mouse": "#2a6f97", "elephant": "#d00000"}
+    for ax, data, title in ((ax1, flow_share, "share of flows"), (ax2, byte_share, "share of bytes")):
+        labels = list(data.keys())
+        values = list(data.values())
+        ax.pie(values, labels=labels, colors=[colors[l] for l in labels], autopct="%1.0f%%", startangle=90)
+        ax.set_title(title)
+    fig.suptitle("Mice vs. elephants: few flows, most bytes")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Draw a fat-tree topology diagram")
     p.add_argument("-c", "--config", default=None, help="path to YAML config")

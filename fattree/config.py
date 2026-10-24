@@ -43,6 +43,8 @@ DEFAULTS = {
         "init_cwnd": 10,
         "dupack_threshold": 3,         # None disables fast retransmit
         "min_rto_ms": 200,
+        "max_rto_ms": None,  # None -> 60 * min_rto_ms (a cap, not in PHASE3_1's spec, that keeps a
+                             # connection stuck in repeated loss from backing off past any point of recovery)
         "spraying": False,
         "duration_ms": 100,
         "max_k": 8,

@@ -50,9 +50,10 @@ class UdpSender:
 class TcpLiteSender:
     """Per-flow Reno-lite sender state machine (time in integer ns)."""
 
-    def __init__(self, n_packets, min_rto_ns, init_cwnd=10, dupack_threshold=3):
+    def __init__(self, n_packets, min_rto_ns, init_cwnd=10, dupack_threshold=3, max_rto_ns=None):
         self.n_packets = n_packets
         self.min_rto_ns = min_rto_ns
+        self.max_rto_ns = max_rto_ns if max_rto_ns is not None else min_rto_ns * 60
         self.cwnd = float(init_cwnd)
         self.ssthresh = float(1 << 30)
         self.send_base = 0
@@ -96,7 +97,7 @@ class TcpLiteSender:
             alpha, beta = 1 / 8, 1 / 4
             self.rttvar = (1 - beta) * self.rttvar + beta * abs(self.srtt - rtt_sample_ns)
             self.srtt = (1 - alpha) * self.srtt + alpha * rtt_sample_ns
-        self.rto_ns = max(self.min_rto_ns, int(self.srtt + 4 * self.rttvar))
+        self.rto_ns = min(self.max_rto_ns, max(self.min_rto_ns, int(self.srtt + 4 * self.rttvar)))
 
     def on_ack(self, ack_no, now_ns):
         """Returns 'new' | 'dup' | 'fast_retransmit' | 'stale'."""
@@ -132,7 +133,7 @@ class TcpLiteSender:
             return False
         self.ssthresh = max(self.cwnd / 2, 2.0)
         self.cwnd = 1.0
-        self.rto_ns *= 2
+        self.rto_ns = min(self.max_rto_ns, self.rto_ns * 2)
         self.timeout_count += 1
         self.timer_generation += 1
         return True

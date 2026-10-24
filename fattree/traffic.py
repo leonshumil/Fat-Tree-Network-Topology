@@ -252,3 +252,54 @@ def generate_traffic(g, cfg, seed):
     """Build the full flow set for a topology + config: pattern -> pairs -> sized/classed flows."""
     pairs = generate_pairs(g, cfg, seed)
     return assign_sizes_and_classes(pairs, cfg, seed + 1)
+
+
+def generate_poisson_flows(g, cfg, duration_s, seed):
+    """Poisson flow arrivals per host over [0, duration_s] (PHASE3_3_EXP7_MICE_ELEPHANTS.md
+    Part A): each host's arrival rate is chosen so its offered load matches
+    `traffic.load` given the mean flow size under `traffic.size_model`
+    (fixed | mice-elephants; empirical not supported here). Destinations are
+    uniform over the other hosts. Returns flows sorted by start_time (seconds).
+    """
+    hosts = hosts_of(g)
+    others = {src: [h for h in hosts if h != src] for src in hosts}
+    traffic_cfg = cfg["traffic"]
+    load = traffic_cfg["load"]
+    link_capacity_bps = cfg["link_capacity_gbps"] * 1e9
+    offered_bytes_per_s = load * link_capacity_bps / 8
+
+    size_model = traffic_cfg.get("size_model", "fixed")
+    threshold = traffic_cfg.get("elephant_threshold_bytes", 10_000_000)
+    elephant_fraction = traffic_cfg.get("elephant_fraction", 0.1)
+    mouse_lo, mouse_hi = traffic_cfg.get("mouse_size_range", (2_000, 100_000))
+    elephant_lo, elephant_hi = traffic_cfg.get("elephant_size_range", (10_000_000, 1_000_000_000))
+
+    if size_model == "fixed":
+        mean_size = traffic_cfg.get("fixed_size_bytes", 1_000_000)
+    elif size_model == "mice-elephants":
+        mean_size = (elephant_fraction * (elephant_lo + elephant_hi) / 2
+                     + (1 - elephant_fraction) * (mouse_lo + mouse_hi) / 2)
+    else:
+        raise ValueError(f"generate_poisson_flows only supports fixed|mice-elephants, got {size_model!r}")
+    arrival_rate_per_host = offered_bytes_per_s / mean_size  # flows/sec
+
+    rng = random.Random(seed)
+    flows = []
+    for src in hosts:
+        host_rng = random.Random(rng.randrange(2**32))
+        t = host_rng.expovariate(arrival_rate_per_host)
+        while t <= duration_s:
+            dst = host_rng.choice(others[src])
+            if size_model == "fixed":
+                size = mean_size
+            else:
+                if host_rng.random() < elephant_fraction:
+                    size = host_rng.uniform(elephant_lo, elephant_hi)
+                else:
+                    size = host_rng.uniform(mouse_lo, mouse_hi)
+            cls = "elephant" if size >= threshold else "mouse"
+            flows.append(Flow(src, dst, size, t, cls))
+            t += host_rng.expovariate(arrival_rate_per_host)
+
+    flows.sort(key=lambda f: f.start_time)
+    return flows

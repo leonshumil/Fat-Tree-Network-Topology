@@ -20,11 +20,12 @@ from fattree.config import DEFAULT_ALLOWED_K, DEFAULTS
 from fattree.failures import apply_failures
 from fattree.metrics import simulate_multifail_vs_k
 from fattree.routing import get_router
+from fattree.routing.precomputed import PrecomputedPathRouter
 from fattree.sim.flow import simulate_flows
 from fattree.sim.graph import connectivity_and_path_metrics, path_diversity
-from fattree.sim.packet import PacketSimulator
+from fattree.sim.packet import PacketSimulator, simulate_packets
 from fattree.topology import build_fat_tree, build_traditional_tree, hosts_of
-from fattree.traffic import Flow, generate_pairs, generate_traffic
+from fattree.traffic import Flow, generate_pairs, generate_poisson_flows, generate_traffic
 from visualize import (
     plot_critical_failure_pct,
     plot_incast_drop_location,
@@ -32,6 +33,10 @@ from visualize import (
     plot_incast_queue_series,
     plot_incast_timeouts_vs_m,
     plot_link_vs_switch_failures,
+    plot_mice_elephants_bars,
+    plot_mice_elephants_bytes_pie,
+    plot_mice_elephants_line,
+    plot_mice_elephants_mouse_fct_cdf,
     plot_switches_multifail,
     plot_table2,
     plot_throughput_vs_failures,
@@ -447,6 +452,210 @@ def cmd_incast(args):
         print(f"wrote {plot_incast_queue_series(series_row['_queue_series'], args.ms[-1], args.plot_queue)}")
 
 
+# --- mice-elephants (Experiment 7, PHASE3_3_EXP7_MICE_ELEPHANTS.md Part A) --------------------------------------------------------------------
+
+def _analytic_ideal_fct_ns(path, size_bytes, mtu_bytes, capacity_bps, prop_delay_ns):
+    """FCT for `size_bytes` alone on `path` with no contention: the first
+    packet needs the full hop-by-hop (transmission + propagation) delay, and
+    the rest pipeline in behind it at the per-hop transmission rate. Used as
+    the "ideal" baseline for slowdown instead of a second full simulation per
+    flow (hundreds of flows per trial makes that too slow) -- a documented
+    simplification: it ignores tcp_lite's slow-start ramp-up, so it slightly
+    *underestimates* ideal FCT for very small mice where RTT dominates.
+    """
+    if path is None:
+        return None
+    n_hops = len(path) - 1
+    if n_hops <= 0:
+        return 0
+    n_packets = max(1, -(-int(size_bytes) // mtu_bytes))
+    sizes = [mtu_bytes] * (n_packets - 1) + [size_bytes - (n_packets - 1) * mtu_bytes]
+    tx_times_ns = [int(s * 8 * 1e9 / capacity_bps) for s in sizes]
+    return n_hops * (tx_times_ns[0] + prop_delay_ns) + sum(tx_times_ns[1:])
+
+
+def _precompute_router(scheme, g, cfg, flows):
+    """Router for `scheme`, usable by the packet simulator's one-route(flow)-
+    call-per-flow interface. classifier and scheduler are precomputed in
+    arrival order over the whole batch -- see fattree/routing/precomputed.py's
+    docstring for why (a documented simplification vs. live mid-flow
+    rearrangement). The rest route live and need no precomputation."""
+    if scheme == "classifier":
+        router = get_router("classifier", g, cfg)
+        paths = router.route_all(flows)
+        return PrecomputedPathRouter({id(f): p for f, p in zip(flows, paths)}, stats=router.stats())
+    if scheme == "scheduler":
+        # Arrival order, with reservations released once their *estimated*
+        # (analytic, uncongested) completion time has passed -- true release
+        # would need to know actual completion times, which depend on the
+        # simulation this router is about to drive (circular). At k=4 there
+        # are only (k/2)^2=4 inter-pod core paths / k/2=2 intra-pod agg paths
+        # total, so never releasing at all (as a literal one-shot batch
+        # precompute would) exhausts them after just a few elephants and
+        # starves every later one of a path entirely -- this estimate is a
+        # documented approximation, not the real thing.
+        router = get_router("scheduler", g, cfg)
+        mtu = cfg["packet"]["mtu_bytes"]
+        cap_bps = cfg["link_capacity_gbps"] * 1e9
+        prop_ns = cfg["packet"]["propagation_delay_ns"]
+        paths_by_id = {}
+        pending = []  # (estimated_release_time_s, flow)
+        for f in sorted(flows, key=lambda fl: fl.start_time):
+            still_pending = []
+            for release_time, pending_flow in pending:
+                if release_time <= f.start_time:
+                    router.release(pending_flow)
+                else:
+                    still_pending.append((release_time, pending_flow))
+            pending = still_pending
+
+            path = router.route(f)
+            paths_by_id[id(f)] = path
+            if path is not None:
+                ideal_ns = _analytic_ideal_fct_ns(path, f.size_bytes, mtu, cap_bps, prop_ns)
+                pending.append((f.start_time + ideal_ns / 1e9, f))
+        return PrecomputedPathRouter(paths_by_id, stats=router.stats())
+    return get_router(scheme, g, cfg)
+
+
+def cmd_mice_elephants(args):
+    k = args.k
+    g = build_fat_tree(k)
+    schemes = ["single-path", "ecmp", "two-level", "classifier", "scheduler"]
+    # Poisson arrivals spread across the whole generation window, so some flows
+    # (especially multi-MB elephants) land close to any hard cutoff with no
+    # real chance to finish -- not congestion, just an edge-of-window artifact.
+    # Fix: only *measure* flows starting in [warmup, warmup+duration), but let
+    # the simulation itself run `tail_ms` longer so those flows get a fair
+    # chance to complete even if they start right at the end of that window.
+    warmup_s = args.warmup_ms / 1000
+    measure_end_s = (args.warmup_ms + args.duration_ms) / 1000
+    sim_duration_s = (args.warmup_ms + args.duration_ms + args.tail_ms) / 1000
+
+    rows = []
+    cdf_data = {}  # (load, scheme) -> mouse FCT ns list, load=0.7 trial 0 (figure 5)
+    bar_data = {}  # scheme -> (mouse_slowdown_mean, elephant_slowdown_mean) at load=0.5 (figure 1)
+    p99_bar_data = {}  # scheme -> mouse p99 slowdown at load=0.5 (figure 2)
+    byte_share = {"mouse": 0, "elephant": 0}
+    flow_share = {"mouse": 0, "elephant": 0}
+
+    for load in args.loads:
+        for scheme in schemes:
+            mouse_fcts_ns, elephant_fcts_ns = [], []
+            mouse_slowdowns, elephant_slowdowns = [], []
+            elephant_goodputs = []
+            mouse_unfinished = elephant_unfinished = 0
+            mouse_flows_n = elephant_flows_n = 0
+            extra_stats = {}
+
+            for t in range(args.trials):
+                cfg = copy.deepcopy(DEFAULTS)
+                cfg["topology"]["k"] = k
+                cfg["routing"] = "two-level" if scheme in ("classifier", "scheduler") else scheme
+                cfg["traffic"]["load"] = load
+                cfg["traffic"]["size_model"] = "mice-elephants"
+                cfg["traffic"]["elephant_fraction"] = args.elephant_fraction
+                cfg["traffic"]["mouse_size_range"] = [2_000, 100_000]
+                cfg["traffic"]["elephant_size_range"] = [1_000_000, 10_000_000]
+                cfg["traffic"]["elephant_threshold_bytes"] = args.elephant_threshold_bytes
+                cfg["packet"]["transport"] = "tcp_lite"
+                cfg["packet"]["min_rto_ms"] = 1
+                cfg["packet"]["dupack_threshold"] = 3
+                cfg["packet"]["queue_size_packets"] = 100
+                cfg["packet"]["duration_ms"] = args.warmup_ms + args.duration_ms + args.tail_ms
+                cfg["classifier"]["rearrange_interval_s"] = 0.01
+
+                flows = generate_poisson_flows(g, cfg, sim_duration_s, seed=args.seed + t)
+                router = _precompute_router(scheme, g, cfg, flows)
+                result = simulate_packets(g, router, flows, cfg)
+                extra_stats = router.stats()
+
+                mtu = cfg["packet"]["mtu_bytes"]
+                cap_bps = cfg["link_capacity_gbps"] * 1e9
+                prop_ns = cfg["packet"]["propagation_delay_ns"]
+                trial_mouse_fcts = []
+
+                if load == args.loads[0] and t == 0:
+                    measured_flows = [f for f in flows if warmup_s <= f.start_time < measure_end_s]
+                    offered = sum(f.size_bytes for f in measured_flows) / (measure_end_s - warmup_s)
+                    target = load * cap_bps / 8 * len(hosts_of(g))  # network-wide, not per-host
+                    print(f"  [offered-load check] scheme={scheme} load={load}: "
+                          f"measured={offered / 1e6:.1f} MB/s target={target / 1e6:.1f} MB/s "
+                          f"({100 * offered / target:.1f}%)")
+
+                for idx, flow in enumerate(flows):
+                    if not (warmup_s <= flow.start_time < measure_end_s):
+                        continue
+                    is_mouse = flow.cls == "mouse"
+                    if is_mouse:
+                        mouse_flows_n += 1
+                    else:
+                        elephant_flows_n += 1
+                    byte_share[flow.cls] += flow.size_bytes
+                    flow_share[flow.cls] += 1
+
+                    fs = result["flow_stats"][idx]
+                    if fs.fct_ns() is None:
+                        if is_mouse:
+                            mouse_unfinished += 1
+                        else:
+                            elephant_unfinished += 1
+                        continue
+
+                    path = router.route(flow)
+                    ideal_ns = _analytic_ideal_fct_ns(path, flow.size_bytes, mtu, cap_bps, prop_ns)
+                    sd = (fs.fct_ns() / ideal_ns) if ideal_ns else None
+
+                    if is_mouse:
+                        mouse_fcts_ns.append(fs.fct_ns())
+                        trial_mouse_fcts.append(fs.fct_ns())
+                        if sd is not None:
+                            mouse_slowdowns.append(sd)
+                    else:
+                        elephant_fcts_ns.append(fs.fct_ns())
+                        elephant_goodputs.append(fs.goodput_bps())
+                        if sd is not None:
+                            elephant_slowdowns.append(sd)
+
+                if load == 0.7 and t == 0:
+                    cdf_data[scheme] = sorted(trial_mouse_fcts)
+
+            mouse_mean, mouse_ci = _mean_ci95(mouse_slowdowns) if mouse_slowdowns else (None, None)
+            eleph_mean, eleph_ci = _mean_ci95(elephant_slowdowns) if elephant_slowdowns else (None, None)
+            mouse_p99 = sorted(mouse_slowdowns)[int(0.99 * (len(mouse_slowdowns) - 1))] if mouse_slowdowns else None
+            eleph_goodput_mean, eleph_goodput_ci = (
+                _mean_ci95(elephant_goodputs) if elephant_goodputs else (None, None))
+
+            row = {
+                "load": load, "scheme": scheme,
+                "mouse_slowdown_mean": mouse_mean, "mouse_slowdown_ci95": mouse_ci,
+                "mouse_slowdown_p99": mouse_p99,
+                "elephant_slowdown_mean": eleph_mean, "elephant_slowdown_ci95": eleph_ci,
+                "elephant_goodput_mean_bps": eleph_goodput_mean, "elephant_goodput_ci95_bps": eleph_goodput_ci,
+                "mouse_unfinished": mouse_unfinished, "elephant_unfinished": elephant_unfinished,
+                "mouse_flows_n": mouse_flows_n, "elephant_flows_n": elephant_flows_n,
+                "rearrangements": extra_stats.get("rearrangements"),
+                "placements": extra_stats.get("placements"),
+                "mean_placement_time_s": extra_stats.get("mean_placement_time_s"),
+            }
+            rows.append(row)
+            print(f"load={load} {scheme:<12} mouse_slowdown={mouse_mean} (p99={mouse_p99}) "
+                  f"elephant_slowdown={eleph_mean} elephant_goodput={eleph_goodput_mean} "
+                  f"unfinished(m/e)={mouse_unfinished}/{elephant_unfinished}")
+
+            if load == 0.5:
+                bar_data[scheme] = (mouse_mean, eleph_mean)
+                p99_bar_data[scheme] = mouse_p99
+
+    _write_csv(args.csv, rows)
+    print(f"wrote {plot_mice_elephants_bars(bar_data, args.plot_bars)}")
+    print(f"wrote {plot_mice_elephants_bars({s: (p, None) for s, p in p99_bar_data.items()}, args.plot_p99_bars, ylabel='mouse p99 slowdown', title='Mouse tail latency (p99 slowdown) by scheme, load=0.5', single=True)}")
+    print(f"wrote {plot_mice_elephants_line(rows, schemes, 'mouse_slowdown_p99', 'mouse p99 slowdown', args.plot_mouse_line)}")
+    print(f"wrote {plot_mice_elephants_line(rows, schemes, 'elephant_goodput_mean_bps', 'elephant goodput (bps)', args.plot_elephant_line)}")
+    print(f"wrote {plot_mice_elephants_mouse_fct_cdf(cdf_data, args.plot_cdf)}")
+    print(f"wrote {plot_mice_elephants_bytes_pie(flow_share, byte_share, args.plot_pie)}")
+
+
 # --- CLI --------------------------------------------------------------------
 
 def main():
@@ -515,6 +724,27 @@ def main():
     p6.add_argument("--plot-timeouts", default="figures/incast_timeouts_vs_m.png")
     p6.add_argument("--plot-queue", default="figures/incast_queue_series.png")
     p6.set_defaults(func=cmd_incast)
+
+    p7 = sub.add_parser("mice-elephants", help="Experiment 7: FCT/slowdown of mice vs elephants, by routing scheme")
+    p7.add_argument("--k", type=int, default=4)
+    p7.add_argument("--loads", type=float, nargs="+", default=[0.3, 0.5, 0.7])
+    p7.add_argument("--duration-ms", type=float, default=200)
+    p7.add_argument("--warmup-ms", type=float, default=20)
+    p7.add_argument("--tail-ms", type=float, default=300,
+                    help="extra simulated time past the measurement window so late-arriving "
+                         "elephants have a fair chance to finish (not itself measured)")
+    p7.add_argument("--trials", type=int, default=5)
+    p7.add_argument("--seed", type=int, default=1)
+    p7.add_argument("--elephant-fraction", type=float, default=0.1)
+    p7.add_argument("--elephant-threshold-bytes", type=int, default=100_000)
+    p7.add_argument("--csv", default="results/mice_elephants.csv")
+    p7.add_argument("--plot-bars", default="figures/mice_elephants_slowdown_bars.png")
+    p7.add_argument("--plot-p99-bars", default="figures/mice_elephants_mouse_p99_bars.png")
+    p7.add_argument("--plot-mouse-line", default="figures/mice_elephants_mouse_p99_vs_load.png")
+    p7.add_argument("--plot-elephant-line", default="figures/mice_elephants_elephant_goodput_vs_load.png")
+    p7.add_argument("--plot-cdf", default="figures/mice_elephants_mouse_fct_cdf.png")
+    p7.add_argument("--plot-pie", default="figures/mice_elephants_bytes_pie.png")
+    p7.set_defaults(func=cmd_mice_elephants)
 
     args = parser.parse_args()
     args.func(args)

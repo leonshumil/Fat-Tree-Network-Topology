@@ -45,6 +45,7 @@ packet:
   init_cwnd: 10
   dupack_threshold: 3              # null disables fast retransmit
   min_rto_ms: 200
+  max_rto_ms: null                 # null -> 60 * min_rto_ms (caps exponential backoff)
   spraying: false
   duration_ms: 100                 # simulated time limit
   max_k: 8

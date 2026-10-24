@@ -156,11 +156,13 @@ time with a Python discrete-event loop:
   Reno-like reliable transport with RFC 6298 RTO), restricted to `k ≤ 8` since
   it is the slowest engine by orders of magnitude. The right tool for
   queueing/drop/reordering/FCT/timeout questions — used for
-  [Experiment 9 (Incast)](#experiment-9-incast) below, and exercised directly
-  by `tests/test_packet_sim.py`'s 13 required validation tests (exact delay
-  formulas, queue-overflow drop counts, an M/D/1 queueing-theory check,
-  reordering under spraying, etc.). Limitation: no SACK, no delayed ACKs, no
-  ECN, simplified fast recovery (see the Incast results for how this shows up).
+  [Experiment 9 (Incast)](#experiment-9-incast) and
+  [Experiment 7 (Mice vs. elephants)](#experiment-7-mice-vs-elephants) below,
+  and exercised directly by `tests/test_packet_sim.py`'s 13 required
+  validation tests (exact delay formulas, queue-overflow drop counts, an M/D/1
+  queueing-theory check, reordering under spraying, etc.). Limitation: no
+  SACK, no delayed ACKs, no ECN, simplified fast recovery (see the Incast and
+  Mice vs. elephants results for how this shows up).
 
 ## Input parameters
 
@@ -222,6 +224,7 @@ python analysis.py table2 --k 4 --trials 15
 python analysis.py throughput-vs-failures --ks 8 16 --pcts 0 5 10 15 20 25 30 --trials 15
 python analysis.py link-vs-switch --k 16 --pcts 0 1 2 5 10 15 20 --trials 15
 python analysis.py incast --k 4 --ms 1 2 4 8 15 --queue-sizes 32 64 128 --rounds 10 --trials 5
+python analysis.py mice-elephants --k 4 --loads 0.3 0.5 0.7 --trials 3
 ```
 
 Example output:
@@ -256,7 +259,7 @@ example); and all three simulation levels, including `fattree/sim/graph.py`'s
 metrics against brute-force host-pair BFS across several `k`/failure
 combinations, `fattree/sim/flow.py`'s max-min fairness against the classic
 asymmetric-bottleneck textbook example, and `fattree/sim/packet.py`'s exact
-delay/drop/reorder/retransmission properties (see Results below). 185 tests,
+delay/drop/reorder/retransmission properties (see Results below). 194 tests,
 all passing.
 
 ## Results
@@ -560,10 +563,111 @@ a production DCTCP/SACK-enabled stack would show, but the *qualitative*
 cliff/RTO/topology findings above are the same phenomena real incast research
 documents.
 
+### Experiment 7: Mice vs. elephants
+
+**The question.** Datacenter traffic is famously bimodal: many small "mouse"
+flows (control messages, RPCs) and a few huge "elephant" flows that carry most
+of the bytes. The paper's flow classifier (§3.6) and flow scheduler (§3.7) both
+exist to keep elephants from starving mice of queue space. Do they?
+
+**Setup and an important simplification.** `k=4`, `transport: tcp_lite`
+(`min_rto_ms=1`, `dupack_threshold=3`), `queue_size_packets=100`. Poisson flow
+arrivals per host (`generate_poisson_flows`, new for this experiment) at
+`load ∈ {0.3, 0.5, 0.7}`, sizes from `mice-elephants` (mice 2–100 KB, elephants
+1–10 MB, `elephant_fraction=0.1` — the paper's defaults, scaled down from the
+flow-level experiments' up-to-1GB range so a 10 MB elephant finishes in a
+reasonable simulated time). 3 trials per point (reduced from the planned 10;
+each (load × scheme × trial) run already simulates hundreds of flows and
+hundreds of thousands of events). Flows are generated over a window longer
+than what's measured (a `tail_ms` buffer) so a flow landing late in the
+*generation* window still gets a fair chance to finish — otherwise Poisson
+arrivals near a hard cutoff look like "collapse" that's really just an
+artifact of the window edge, not congestion.
+
+**The simplification PHASE3_3_EXP7_MICE_ELEPHANTS.md asks for but this
+implementation doesn't fully provide:** the spec wants classifier's periodic
+rearrangement and scheduler's elephant-detection to run as *live hooks inside
+the packet engine*, changing an active flow's path mid-stream. Building that
+is effectively a second major engine extension on top of Phase 3.1's rewrite;
+instead, `fattree/routing/precomputed.py`'s `PrecomputedPathRouter` replays a
+path decided **once, at flow arrival, from the already-known batch** —
+`classifier.route_all()` over the whole set for classifier, and sequential
+reservation-with-*estimated*-release (using each flow's analytic uncongested
+FCT, since true release needs the simulation's own output — a circular
+dependency) for scheduler. single-path/ecmp/two-level are unaffected (they
+already route live, per flow, with no batching). This is the single most
+important caveat on everything below.
+
+Reproduce: `python analysis.py mice-elephants --k 4 --loads 0.3 0.5 0.7 --trials 3`
+→ `results/mice_elephants.csv` + the figures below.
+
+![Mean slowdown by scheme, mice vs. elephants, load=0.5: scheduler has the lowest mouse slowdown but no completed elephants (N/A)](figures/mice_elephants_slowdown_bars.png)
+
+![Mouse p99 (tail) slowdown by scheme, load=0.5](figures/mice_elephants_mouse_p99_bars.png)
+
+![Mouse p99 slowdown vs. load, by scheme](figures/mice_elephants_mouse_p99_vs_load.png)
+
+![Elephant goodput vs. load, by scheme](figures/mice_elephants_elephant_goodput_vs_load.png)
+
+**Discussion (slowdown and tail latency).** At load=0.5, mean mouse slowdown
+ranges from 22.7x (single-path) down to 5.8x (scheduler) — every scheme is far
+from the "near 1" ideal because at this `k=4` scale, 0.1-elephant-fraction
+Poisson traffic with up to 10 MB flows creates sustained heavy congestion, not
+the lightly-loaded regime the low-load validation test checks (see Testing
+below). The *ranking* is the real signal: **scheduler gives mice the lowest
+slowdown at every load** (2.1x / 5.8x / 8.2x at 0.3/0.5/0.7) — consistent with
+its purpose, since mice never share two-level's upward ports with an elephant
+that got pulled onto a reservation (or dropped entirely; see below). **Mouse
+tail latency (p99) is where the spread is starkest**: single-path's p99
+reaches 545–713x at loads 0.5–0.7 (a few mice get stuck behind a long-lived
+elephant on their one fixed path with nowhere else to go), while scheduler's
+p99 stays far lower (3.4x / 7.9x / 151x) across the same loads. classifier's
+p99 is erratic (127x at load=0.5, worse than ecmp/two-level at that load)
+despite a reasonable *mean* — the clearest symptom of the precomputed-batch
+simplification: its least-loaded-port decision is made once from a byte-count
+snapshot of the whole arrival batch, not the actual, continuously-changing
+queue state a live classifier would react to, so it can commit a batch of
+flows onto a port that becomes a hotspot once they're actually running
+concurrently.
+
+**Discussion (elephants).** Elephant goodput at load=0.5 ranges from 283 Mb/s
+(single-path) to 604 Mb/s (classifier); classifier and two-level are the
+strongest performers here, static single-path the weakest. **Scheduler's own
+elephants are the clear failure case: zero completed in any load** (marked
+"N/A" in the bar chart). The root cause is structural, not a bug: at `k=4`
+there are only `(k/2)²=4` inter-pod core paths and `k/2=2` intra-pod agg
+paths, and dozens of elephants arrive per trial — even with estimated-release
+reuse, that pool is too small to serve them all, and an elephant that gets a
+reservation still shares its path's physical links with ordinary two-level
+mouse traffic (which isn't reservation-aware), so "reserved" is not the same
+as "uncontended." This is a direct, concrete illustration of why the paper's
+own design assumes central reservation state scales with network size — at
+`k=4`'s scale it visibly does not.
+
+![CDF of mouse FCT by scheme, load=0.7](figures/mice_elephants_mouse_fct_cdf.png)
+
+**Discussion (CDF).** At load=0.7 the curves separate clearly in the tail:
+single-path's CDF (gray) lags noticeably past the 90th percentile and stretches
+out past 400ms, while scheduler, classifier, and two-level cluster tighter near
+the low end — the CDF makes directly visible what the p99 bar chart summarizes
+as a single number.
+
+![Share of flows vs. share of bytes by class: ~10% of flows (elephants) carry ~93% of bytes](figures/mice_elephants_bytes_pie.png)
+
+**Discussion (bytes).** With `elephant_fraction=0.1`, elephants are 10% of
+flows but 93% of bytes (mice: 90% of flows, 7% of bytes) — the textbook "few
+flows, most bytes" shape that motivates treating the two classes differently
+in the first place (per-flow fairness would let the 90% of mouse flows starve
+the much larger-but-rarer elephants' bandwidth needs, while per-byte fairness
+would let elephants dominate every mouse's queue — neither is obviously
+"fair," which is exactly the tension the classifier/scheduler are trying to
+manage).
+
 ## Not done / future work
 
-`PHASE2_PROMPT.md` Step 5 and `PHASE3_*.md` specify 9 experiments total; 5 are
-done (the 4 Phase 2 experiments plus Experiment 9, Incast). Four remain:
+`PHASE2_PROMPT.md` Step 5 and `PHASE3_*.md` specify 9 experiments total; 6 are
+done (the 4 Phase 2 experiments, Experiment 9 Incast, and Experiment 7 Mice vs.
+elephants). Three remain:
 
 - **collisions_vs_k** — throughput lost to two-level/ECMP hash collisions vs.
   `k` (paper §5.3 predicts it shrinks as `k` grows). Mechanically similar to
@@ -574,17 +678,23 @@ done (the 4 Phase 2 experiments plus Experiment 9, Incast). Four remain:
   already records exactly this (`placements`, `mean_placement_time_s`,
   `link_state_entries`, `flow_state_entries`) — only the sweep-and-plot script
   is missing.
-- **Experiment 7 (mice vs. elephants)** and **Experiment 8 (reordering:
-  spraying vs. per-flow hashing)** — both packet-level (`k ∈ {4, 8}`),
-  specified in `PHASE3_1_EXP8_REORDERING.md` and `PHASE3_3_EXP7_MICE_ELEPHANTS.md`.
-  The packet engine built for Experiment 9 (`fattree/sim/packet.py`,
-  `fattree/sim/transport.py`) already supports everything both experiments
-  need (tcp_lite, spraying, FCT by class, classifier/scheduler routing) and
-  `tests/test_packet_sim.py` directly demonstrates spraying-induced reordering
-  and per-flow-hashing's lack of it — these two just need their own
-  round/sweep-and-plot wrappers in `analysis.py`, the same pattern used for
-  `incast`.
+- **Experiment 8 (reordering: spraying vs. per-flow hashing)** — packet-level
+  (`k ∈ {4, 8}`), specified in `PHASE3_1_EXP8_REORDERING.md` Part B. The
+  packet engine already supports everything it needs (spraying, FCT by class)
+  and `tests/test_packet_sim.py` directly demonstrates spraying-induced
+  reordering and per-flow-hashing's lack of it — it just needs its own
+  round/sweep-and-plot wrapper in `analysis.py`, the same pattern used for
+  `incast`/`mice-elephants`.
 - The `web/` GitHub Pages interactive site (`CLAUDE.md` §7) — not started.
+- **Live classifier/scheduler rearrangement inside the packet engine.**
+  Experiment 7 (above) uses `PrecomputedPathRouter` (routing decided once per
+  flow at arrival from the already-known batch) instead of PHASE3_3's
+  literal spec (periodic rearrangement and elephant-detection as live events
+  mid-flow) — the single biggest simplification in this submission, and
+  directly responsible for Experiment 7's two weakest findings (classifier's
+  erratic tail latency, scheduler's elephants never completing). Building the
+  live version is a second major engine extension on the scale of Phase 3.1's
+  rewrite.
 - `build_traditional_tree`'s oversubscription is fixed by its structure, not a
   tunable parameter (needed for an exact 3.6:1 match to the paper's Table 2
   hardware; see the Table 2 discussion above).
@@ -600,49 +710,73 @@ This project was developed with AI assistance (Claude, Anthropic), used for:
 scaffolding the repository structure; implementing `fattree/topology.py`
 (including the traditional-tree baseline), `fattree/failures.py` (including the
 randomized `[min, max]` failure-pct ranges), `fattree/config.py`,
-`fattree/metrics.py`, `fattree/traffic.py` (all 8 traffic patterns),
-`fattree/routing/` (all 5 schemes — the two-level router's exact port-wiring
-convention was reverse-engineered from the paper's own worked example, read
-directly from the PDF, and verified to reproduce it), `fattree/sim/` (all 3
-simulation engines), `visualize.py`, and `analysis.py`, all from a specification
-written by the author (see `CLAUDE.md` and `PHASE2_PROMPT.md`); and writing the
-accompanying pytest suite (185 tests), including brute-force/closed-form checks
-of the multi-failure formula and the graph-level connectivity metrics, and the
-paper-example verification for two-level routing. Three real bugs were found
-and fixed during this process by tracing actual behavior against expectations
-rather than trusting aggregate output (documented inline where fixed): a
-Python-level aggregation bottleneck in `fattree/sim/graph.py` (47s → <1s at
-k=48); `fattree/sim/flow.py` modeling links as undirected, which made
-opposite-direction flows on the same physical link falsely contend for one
-shared capacity (caught via the Table 2 reproduction showing an implausible
-flat 50% ceiling); and two bugs in `fattree/sim/packet.py`'s event scheduling
-(UDP pacing, window-transport ACK counting) caught by tracing actual packet
-delivery order rather than trusting aggregate counts. All formulas, the
-addressing scheme, and the failure/traffic/routing models were specified by
-the author with reference to the paper; the author has reviewed and
-understands every line submitted and is responsible for its correctness.
+`fattree/metrics.py`, `fattree/traffic.py` (all 8 traffic patterns plus the
+Poisson flow-arrival generator for Experiment 7), `fattree/routing/` (all 5
+schemes plus the `PrecomputedPathRouter` adapter — the two-level router's
+exact port-wiring convention was reverse-engineered from the paper's own
+worked example, read directly from the PDF, and verified to reproduce it),
+`fattree/sim/` (all 3 simulation engines, including the Phase 3.1 rewrite of
+the packet engine into `packet.py`/`transport.py`/`packet_metrics.py` with a
+real Reno-like `tcp_lite` transport), `visualize.py`, and `analysis.py`, all
+from a specification written by the author (see `CLAUDE.md`,
+`PHASE2_PROMPT.md`, and `PHASE3_*.md`); and writing the accompanying pytest
+suite (194 tests), including brute-force/closed-form checks of the
+multi-failure formula and the graph-level connectivity metrics, the
+paper-example verification for two-level routing, and `tests/test_packet_sim.py`'s
+13 required engine-validation tests (exact delay formulas, an M/D/1
+queueing-theory check, etc.).
+
+Several real bugs were found and fixed during this process by tracing actual
+behavior against expectations rather than trusting aggregate output
+(documented inline where fixed): a Python-level aggregation bottleneck in
+`fattree/sim/graph.py` (47s → <1s at k=48); `fattree/sim/flow.py` modeling
+links as undirected, which made opposite-direction flows on the same physical
+link falsely contend for one shared capacity (caught via the Table 2
+reproduction showing an implausible flat 50% ceiling); the original Phase 2
+packet engine's UDP pacing and ACK-counting bugs (superseded by the Phase 3.1
+rewrite, which itself needed the same class of fix — cumulative-clock pacing —
+reapplied); and, in Phase 3.1/3.2, an unbounded RTO-backoff bug (a connection
+stuck in repeated loss would double its retransmit timer forever and never
+get another chance within a simulation's time budget, caught by Experiment
+7's elephants mysteriously never completing even with hundreds of
+milliseconds to spare) and a scheduler reservation-exhaustion bug in
+Experiment 7's precomputed router (never releasing a reservation starved
+every elephant after the first few, since k=4 has only 4 core paths total).
+All formulas, the addressing scheme, and the failure/traffic/routing models
+were specified by the author with reference to the paper; the author has
+reviewed and understands every line submitted and is responsible for its
+correctness.
 
 ## Status
 
-Phase 1 (topology, failures, config/CLI) and most of Phase 2
-(`PHASE2_PROMPT.md` Steps 1–4: allowed-k policy, traffic patterns, all 5
-routing schemes, all 3 simulation levels) are complete and tested. Of Step 5's
-9 experiments, 4 were run to completion with full write-ups above; the other 5
-are designed but not run, and the `web/` site is not started — see
+Phase 1 (topology, failures, config/CLI), all of Phase 2 (`PHASE2_PROMPT.md`
+Steps 1–4: allowed-k policy, traffic patterns, all 5 routing schemes, all 3
+simulation levels), and most of Phase 3 (`PHASE3_*.md`: the packet engine
+rewrite, Incast, Mice vs. elephants) are complete and tested. Of the 9
+experiments across both phases, 6 were run to completion with full
+write-ups above; 3 remain (collisions_vs_k, scheduler_cost_vs_k, Experiment 8
+Reordering), and the `web/` site is not started — see
 [Not done / future work](#not-done--future-work) for specifics. Known
 limitations of what *is* here:
 
-- **Packet-level realism.** `fattree/sim/packet.py`'s window transport is a
-  simple fixed-window ACK/timeout scheme, not real TCP (no slow start, no
-  congestion avoidance, no multi-flow fairness beyond what max-min-style
-  queueing happens to produce).
+- **Precomputed classifier/scheduler routing at packet level (Experiment 7).**
+  The single biggest simplification in this submission — see the dedicated
+  bullet under [Not done / future work](#not-done--future-work) and the
+  Experiment 7 discussion for what this costs: classifier's erratic tail
+  latency and scheduler's elephants never completing are both direct
+  consequences of it, not independent bugs.
+- **tcp_lite realism.** No SACK, no delayed ACKs, no ECN, simplified fast
+  recovery (cwnd set directly to the new ssthresh) — see the Incast and Mice
+  vs. elephants discussions for where this shows up most.
 - **Traditional-tree calibration.** Its oversubscription ratio is whatever its
   fixed structure produces, not a tunable match to the paper's specific
   hardware (see the Table 2 discussion).
-- **Classifier/scheduler fidelity.** Both are functional approximations of the
-  paper's Algorithm 3 and Sec. 4.3 scheduler, not literal re-implementations —
-  the Table 2 discussion above quantifies where this shows up.
-- **Further adversarial testing.** The test suite is substantial (185 tests)
+- **Classifier/scheduler fidelity (flow level).** Both are functional
+  approximations of the paper's Algorithm 3 and Sec. 4.3 scheduler, not
+  literal re-implementations — the Table 2 discussion quantifies where this
+  shows up at the flow level (separately from the packet-level precomputation
+  issue above).
+- **Further adversarial testing.** The test suite is substantial (194 tests)
   but has not been independently red-teamed; larger-`k` combinations of
   simultaneous link + switch failures, and packet-level edge cases beyond what
-  Step 4's required properties covered, are comparatively undertested.
+  the required validation tests covered, are comparatively undertested.

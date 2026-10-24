@@ -80,6 +80,8 @@ class PacketSimulator:
         self.init_cwnd = packet_cfg.get("init_cwnd", 10)
         self.dupack_threshold = packet_cfg.get("dupack_threshold", 3)
         self.min_rto_ns = int(packet_cfg.get("min_rto_ms", 200) * 1e6)
+        max_rto_ms = packet_cfg.get("max_rto_ms") or 60 * packet_cfg.get("min_rto_ms", 200)
+        self.max_rto_ns = int(max_rto_ms * 1e6)
         self.spraying = packet_cfg.get("spraying", False)
         self.duration_ns = int(packet_cfg.get("duration_ms", 100) * 1e6)
         self.capacity_bps = cfg["link_capacity_gbps"] * 1e9
@@ -152,7 +154,8 @@ class PacketSimulator:
                 for seq, t in enumerate(sender.send_times_ns()):
                     self._schedule(start_ns + t, "send", (idx, seq))
             elif self.transport_name == "tcp_lite":
-                self.senders[idx] = TcpLiteSender(n_packets, self.min_rto_ns, self.init_cwnd, self.dupack_threshold)
+                self.senders[idx] = TcpLiteSender(n_packets, self.min_rto_ns, self.init_cwnd,
+                                                   self.dupack_threshold, self.max_rto_ns)
                 self.receivers[idx] = TcpLiteReceiver()
                 self._schedule(start_ns, "flow_start", (idx,))
             else:
