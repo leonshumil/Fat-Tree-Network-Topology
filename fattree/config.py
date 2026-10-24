@@ -33,6 +33,17 @@ DEFAULTS = {
     "routing": "two-level",
     "two_level": {"failover": False},
     "classifier": {"rearrange_interval_s": 1.0, "max_moves": 3, "max_rounds": 20},
+    "simulation": {"level": "flow"},
+    "packet": {
+        "mtu_bytes": 1500,
+        "queue_size_packets": 100,
+        "propagation_delay_us": 1,
+        "transport": "udp",
+        "window_packets": 10,
+        "timeout_ms": 1,
+        "spraying": False,
+        "duration_ms": 100,
+    },
     "link_capacity_gbps": 1,
     "trials": 30,
     "seed": 1,
@@ -49,6 +60,9 @@ VALID_PATTERNS = {
 VALID_SIZE_MODELS = {"fixed", "mice-elephants", "empirical"}
 VALID_ROUTING = {"ecmp", "two-level", "single-path", "classifier", "scheduler"}
 VALID_MODES = {"exact", "bernoulli"}
+VALID_SIM_LEVELS = {"graph", "flow", "packet"}
+VALID_TRANSPORTS = {"udp", "window"}
+PACKET_MAX_K = 8
 
 
 def _deep_merge(base, override):
@@ -153,6 +167,17 @@ def validate_config(cfg):
 
     if cfg["routing"] not in VALID_ROUTING:
         raise ValueError(f"routing must be one of {VALID_ROUTING}, got {cfg['routing']!r}")
+
+    sim_level = cfg.get("simulation", {}).get("level", "flow")
+    if sim_level not in VALID_SIM_LEVELS:
+        raise ValueError(f"simulation.level must be one of {VALID_SIM_LEVELS}, got {sim_level!r}")
+    if sim_level == "packet" and k > PACKET_MAX_K:
+        raise ValueError(f"simulation.level 'packet' only supports k <= {PACKET_MAX_K} (got k={k})")
+
+    packet_cfg = cfg.get("packet", {})
+    transport = packet_cfg.get("transport", "udp")
+    if transport not in VALID_TRANSPORTS:
+        raise ValueError(f"packet.transport must be one of {VALID_TRANSPORTS}, got {transport!r}")
 
     if cfg["trials"] < 1:
         raise ValueError(f"trials must be >= 1, got {cfg['trials']!r}")

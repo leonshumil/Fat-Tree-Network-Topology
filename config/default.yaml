@@ -34,6 +34,17 @@ classifier:
   rearrange_interval_s: 1.0       # paper: t = 1s
   max_moves: 3                    # flows moved per rearrangement (Algorithm 3)
   max_rounds: 20                  # stop early once a round moves nothing
+simulation:
+  level: flow                     # graph | flow | packet (packet only supports k <= 8)
+packet:
+  mtu_bytes: 1500
+  queue_size_packets: 100
+  propagation_delay_us: 1
+  transport: udp                  # udp | window
+  window_packets: 10
+  timeout_ms: 1
+  spraying: false
+  duration_ms: 100
 link_capacity_gbps: 1
 trials: 30
 seed: 1
