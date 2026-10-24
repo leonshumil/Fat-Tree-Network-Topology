@@ -10,12 +10,14 @@ Sec. 6), assuming independent (bernoulli) per-link failures across all three
 link layers, so every switch's k ports are equally exposed.
 
 Usage:
-    python analysis.py --ks 4 6 8 10 12 16 --p 1 --trials 30 --seed 1
+    python analysis.py --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1
 """
 import argparse
 import csv
 import os
+import sys
 
+from fattree.config import DEFAULT_ALLOWED_K
 from fattree.metrics import simulate_multifail_vs_k
 from fattree.topology import build_fat_tree
 from visualize import plot_switches_multifail
@@ -23,14 +25,20 @@ from visualize import plot_switches_multifail
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--ks", type=int, nargs="+", default=[4, 6, 8, 10, 12, 16],
-                        help="switch port counts to sweep (even, >= 4)")
+    parser.add_argument("--ks", type=int, nargs="+", default=[4, 8, 16, 24, 32],
+                        help=f"switch port counts to sweep, must be in allowed_k {DEFAULT_ALLOWED_K}")
     parser.add_argument("--p", type=float, default=1.0, help="link failure percentage (default 1%%)")
     parser.add_argument("--trials", type=int, default=30, help="seeded trials per k")
     parser.add_argument("--seed", type=int, default=1, help="base seed; trial t uses seed + t")
     parser.add_argument("--csv", default="results/switches_multifail_vs_k.csv")
     parser.add_argument("--plot", default="figures/switches_multifail_vs_k.png")
     args = parser.parse_args()
+
+    bad_ks = [k for k in args.ks if k not in DEFAULT_ALLOWED_K]
+    if bad_ks:
+        allowed = ", ".join(str(v) for v in DEFAULT_ALLOWED_K)
+        print(f"error: --ks has values not in allowed_k ({allowed}): {bad_ks}", file=sys.stderr)
+        sys.exit(1)
 
     rows = []
     for k in args.ks:

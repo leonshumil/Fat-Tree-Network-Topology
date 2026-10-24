@@ -1,5 +1,7 @@
+allowed_k: [4, 8, 16, 24, 32, 48, 64]  # real switch port counts; k and any sweep.values for
+                                        # topology.k must come from this list
 topology:
-  k: 8                         # switch port count, even, >= 4
+  k: 8                         # switch port count, must be in allowed_k above
   type: fat-tree                # fat-tree | traditional-tree (conventional oversubscribed tree, for comparison)
 failures:
   link_pct: 1                  # % of links that fail; can also be a [min, max] range,

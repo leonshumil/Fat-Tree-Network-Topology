@@ -98,7 +98,8 @@ Set via `config/default.yaml` (or any `-c <path>`), overridable on the command l
 
 | Parameter                | Config path            | CLI flag        | Default | Meaning |
 |---------------------------|-------------------------|------------------|---------|---------|
-| Switch port count          | `topology.k`            | `--k`            | 8       | Even, ≥ 4. Determines every other count: `k³/4` hosts, `5k²/4` switches, `k³/4` links per layer. |
+| Switch port count          | `topology.k`            | `--k`            | 8       | Must be one of `allowed_k` below. Determines every other count: `k³/4` hosts, `5k²/4` switches, `k³/4` links per layer. |
+| Allowed port counts         | `allowed_k`              | —                | `[4, 8, 16, 24, 32, 48, 64]` | Real switch port counts; `topology.k` and any `sweep.values` for `topology.k` must come from this list, or a clear error names the list (e.g. `k=25 is not allowed; choose one of 4, 8, 16, 24, 32, 48, 64`). |
 | Topology type               | `topology.type`         | `--topology-type`| `fat-tree` | `fat-tree \| traditional-tree`. The latter is a conventional oversubscribed tree with the same host count, for comparison — see below. |
 | Link failure %             | `failures.link_pct`     | `--link-pct` / `--link-pct-range MIN MAX` | 1       | % of links removed. Either a fixed number, or a `[min, max]` range (e.g. `[0, 20]`) to pick a random pct each run, drawn from the seeded RNG so it stays reproducible. |
 | Switch failure %           | `failures.switch_pct`   | `--switch-pct` / `--switch-pct-range MIN MAX` | 0       | % of switches removed (with their incident links). Same fixed-or-range option as `link_pct`. |
@@ -139,7 +140,7 @@ python run.py -c config/default.yaml --json
 python visualize.py -c config/default.yaml --out figures/topology.png --summary-out figures/summary.png
 
 # run the switches-with-failed-links-vs-k experiment (see Results below)
-python analysis.py --ks 4 6 8 10 12 16 --p 1 --trials 30 --seed 1
+python analysis.py --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1
 ```
 
 Example output:
@@ -176,20 +177,23 @@ This is the assignment's "intermediate" example metric (Sec. 5): *"Number of
 switches with multiple failed links (at a 1% failure rate) as a function of switch
 port count."*
 
-**Setup.** For each `k ∈ {4, 6, 8, 10, 12, 16}`, build a fat-tree and fail each of
-its links independently with probability `p = 1%` (bernoulli mode, across all three
-link layers so every switch's `k` ports are equally exposed — `--link-layers`
-defaults to `edge-agg`/`agg-core` only, but this experiment needs host-edge
-included too, since the metric is about a switch's *total* port count). Repeat for
-30 seeded trials per `k` (`seed + t`) and take the mean and 95% CI. Compare against
-the closed-form prediction (CLAUDE.md §6), since every switch has exactly `k` ports:
+**Setup.** For each `k` in `allowed_k` up to 32 (`{4, 8, 16, 24, 32}` — real switch
+port counts, config `allowed_k`, PHASE2_PROMPT.md Step 1), build a fat-tree and fail
+each of its links independently with probability `p = 1%` (bernoulli mode, across
+all three link layers so every switch's `k` ports are equally exposed —
+`--link-layers` defaults to `edge-agg`/`agg-core` only, but this experiment needs
+host-edge included too, since the metric is about a switch's *total* port count).
+Repeat for 30 seeded trials per `k` (`seed + t`) and take the mean and 95% CI.
+Compare against the closed-form prediction (CLAUDE.md §6), since every switch has
+exactly `k` ports:
 
 ```
 P(≥2 of k ports fail) = 1 - (1-p)^k - k·p·(1-p)^(k-1)
 ```
 
-Reproduce with `python analysis.py --ks 4 6 8 10 12 16 --p 1 --trials 30 --seed 1`
-→ `results/switches_multifail_vs_k.csv` + the plot below.
+Reproduce with `python analysis.py --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1`
+(any subset of `allowed_k` works, including 48/64) → `results/switches_multifail_vs_k.csv`
++ the plot below.
 
 ![Switches with ≥2 failed links vs. k: simulation mean ± 95% CI tracking the closed-form theory curve](figures/switches_multifail_vs_k.png)
 
@@ -198,7 +202,7 @@ every `k`, within its 95% CI — this is both a correctness check on the failure
 model (`fattree/failures.py` bernoulli mode genuinely applies independent per-link
 probability `p`) and a demonstration of how fast multi-failure exposure grows with
 port count. At `k=4` a switch's 4 ports almost never see 2 failures at `p=1%`
-(≈0.01 switches network-wide); by `k=16` the same per-link rate yields over 3
+(≈0.01 switches network-wide); by `k=32` the same per-link rate yields over 50
 switches with ≥2 failed links on average. This matters because a switch with ≥2
 failed links is the precursor to a *structural* break: in the fat-tree a single
 failed uplink is absorbed by ECMP across the remaining `k/2 - 1` parallel paths,

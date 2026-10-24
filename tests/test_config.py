@@ -3,7 +3,7 @@ import copy
 import pytest
 import yaml
 
-from fattree.config import DEFAULTS, load_config, validate_config
+from fattree.config import DEFAULT_ALLOWED_K, DEFAULTS, load_config, validate_config, validate_k
 
 
 def test_defaults_load_without_file():
@@ -90,3 +90,61 @@ def test_unknown_topology_type_rejected():
     cfg["topology"]["type"] = "nonsense"
     with pytest.raises(ValueError):
         validate_config(cfg)
+
+
+# --- allowed_k (PHASE2_PROMPT.md Step 1) ------------------------------------------
+
+def test_default_allowed_k_list():
+    assert DEFAULT_ALLOWED_K == [4, 8, 16, 24, 32, 48, 64]
+
+
+@pytest.mark.parametrize("k", DEFAULT_ALLOWED_K)
+def test_allowed_k_values_accepted(k):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["topology"]["k"] = k
+    validate_config(cfg)  # should not raise
+
+
+@pytest.mark.parametrize("bad_k", [25, 47, 2, 3, 5, 0, -4, 20])
+def test_disallowed_k_values_rejected(bad_k):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["topology"]["k"] = bad_k
+    with pytest.raises(ValueError):
+        validate_config(cfg)
+
+
+def test_disallowed_k_error_message_matches_spec_example():
+    with pytest.raises(ValueError, match=r"k=25 is not allowed; choose one of 4, 8, 16, 24, 32, 48, 64"):
+        validate_k(25, DEFAULT_ALLOWED_K)
+
+
+def test_custom_allowed_k_list_is_respected():
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["allowed_k"] = [4, 6, 8]
+    cfg["topology"]["k"] = 6
+    validate_config(cfg)  # 6 is not in DEFAULT_ALLOWED_K but is in this config's own list
+
+    cfg["topology"]["k"] = 16
+    with pytest.raises(ValueError):
+        validate_config(cfg)  # 16 is not in this config's custom allowed_k
+
+
+# --- sweep.param = topology.k validation ------------------------------------------
+
+def test_sweep_values_subset_of_allowed_k_accepted():
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["sweep"] = {"param": "topology.k", "values": [4, 8, 16]}
+    validate_config(cfg)  # should not raise
+
+
+def test_sweep_values_with_disallowed_k_rejected():
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["sweep"] = {"param": "topology.k", "values": [4, 8, 25]}
+    with pytest.raises(ValueError, match="25"):
+        validate_config(cfg)
+
+
+def test_sweep_over_other_param_ignores_allowed_k():
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["sweep"] = {"param": "failures.link_pct", "values": [0, 1, 2, 5, 10, 15, 20, 30]}
+    validate_config(cfg)  # should not raise: allowed_k only constrains topology.k sweeps

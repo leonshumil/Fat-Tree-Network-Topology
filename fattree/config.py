@@ -3,7 +3,10 @@ import copy
 
 import yaml
 
+DEFAULT_ALLOWED_K = [4, 8, 16, 24, 32, 48, 64]
+
 DEFAULTS = {
+    "allowed_k": list(DEFAULT_ALLOWED_K),
     "topology": {"k": 8, "type": "fat-tree"},
     "failures": {
         "link_pct": 0,
@@ -48,10 +51,33 @@ def load_config(path=None):
     return cfg
 
 
+def _format_allowed_k(allowed_k):
+    return ", ".join(str(v) for v in sorted(allowed_k))
+
+
+def validate_k(k, allowed_k):
+    """k must be a real switch port count from `allowed_k` (config/default.yaml),
+    not just any even integer >= 4 -- PHASE2_PROMPT.md Step 1."""
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise ValueError(f"topology.k must be an integer, got {k!r}")
+    if k not in allowed_k:
+        raise ValueError(f"k={k} is not allowed; choose one of {_format_allowed_k(allowed_k)}")
+
+
 def validate_config(cfg):
+    allowed_k = cfg.get("allowed_k", DEFAULT_ALLOWED_K)
     k = cfg["topology"]["k"]
-    if not isinstance(k, int) or isinstance(k, bool) or k < 4 or k % 2 != 0:
-        raise ValueError(f"topology.k must be an even integer >= 4, got {k!r}")
+    validate_k(k, allowed_k)
+
+    sweep = cfg.get("sweep")
+    if sweep and sweep.get("param") == "topology.k":
+        values = sweep.get("values", [])
+        bad = [v for v in values if v not in allowed_k]
+        if bad:
+            raise ValueError(
+                f"sweep.values for topology.k must all be in allowed_k "
+                f"({_format_allowed_k(allowed_k)}); invalid: {bad}"
+            )
 
     topology_type = cfg["topology"].get("type", "fat-tree")
     if topology_type not in VALID_TOPOLOGY_TYPES:
