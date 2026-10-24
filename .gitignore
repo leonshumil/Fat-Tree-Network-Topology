@@ -5,3 +5,7 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+
+# Local notes and Claude Code prompts: keep on this computer, do not upload
+*.md
+!README.md

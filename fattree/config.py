@@ -36,13 +36,22 @@ DEFAULTS = {
     "simulation": {"level": "flow"},
     "packet": {
         "mtu_bytes": 1500,
+        "ack_bytes": 64,
         "queue_size_packets": 100,
-        "propagation_delay_us": 1,
-        "transport": "udp",
-        "window_packets": 10,
-        "timeout_ms": 1,
+        "propagation_delay_ns": 1000,
+        "transport": "tcp_lite",       # udp | tcp_lite
+        "init_cwnd": 10,
+        "dupack_threshold": 3,         # None disables fast retransmit
+        "min_rto_ms": 200,
         "spraying": False,
         "duration_ms": 100,
+        "max_k": 8,
+    },
+    "incast": {
+        "receiver": None,              # None -> first host of pod 0
+        "block_bytes": 65_536,
+        "rounds": 20,
+        "sender_placement": "other-pods",  # other-pods | same-pod | random
     },
     "link_capacity_gbps": 1,
     "trials": 30,
@@ -61,7 +70,8 @@ VALID_SIZE_MODELS = {"fixed", "mice-elephants", "empirical"}
 VALID_ROUTING = {"ecmp", "two-level", "single-path", "classifier", "scheduler"}
 VALID_MODES = {"exact", "bernoulli"}
 VALID_SIM_LEVELS = {"graph", "flow", "packet"}
-VALID_TRANSPORTS = {"udp", "window"}
+VALID_TRANSPORTS = {"udp", "tcp_lite"}
+VALID_SENDER_PLACEMENTS = {"other-pods", "same-pod", "random"}
 PACKET_MAX_K = 8
 
 
@@ -171,13 +181,19 @@ def validate_config(cfg):
     sim_level = cfg.get("simulation", {}).get("level", "flow")
     if sim_level not in VALID_SIM_LEVELS:
         raise ValueError(f"simulation.level must be one of {VALID_SIM_LEVELS}, got {sim_level!r}")
-    if sim_level == "packet" and k > PACKET_MAX_K:
-        raise ValueError(f"simulation.level 'packet' only supports k <= {PACKET_MAX_K} (got k={k})")
 
     packet_cfg = cfg.get("packet", {})
+    max_k = packet_cfg.get("max_k", PACKET_MAX_K)
+    if sim_level == "packet" and k > max_k:
+        raise ValueError(f"simulation.level 'packet' only supports k <= {max_k} (got k={k})")
+
     transport = packet_cfg.get("transport", "udp")
     if transport not in VALID_TRANSPORTS:
         raise ValueError(f"packet.transport must be one of {VALID_TRANSPORTS}, got {transport!r}")
+
+    sender_placement = cfg.get("incast", {}).get("sender_placement", "other-pods")
+    if sender_placement not in VALID_SENDER_PLACEMENTS:
+        raise ValueError(f"incast.sender_placement must be one of {VALID_SENDER_PLACEMENTS}, got {sender_placement!r}")
 
     if cfg["trials"] < 1:
         raise ValueError(f"trials must be >= 1, got {cfg['trials']!r}")

@@ -35,16 +35,24 @@ classifier:
   max_moves: 3                    # flows moved per rearrangement (Algorithm 3)
   max_rounds: 20                  # stop early once a round moves nothing
 simulation:
-  level: flow                     # graph | flow | packet (packet only supports k <= 8)
+  level: flow                     # graph | flow | packet (packet only supports k <= max_k below)
 packet:
   mtu_bytes: 1500
+  ack_bytes: 64
   queue_size_packets: 100
-  propagation_delay_us: 1
-  transport: udp                  # udp | window
-  window_packets: 10
-  timeout_ms: 1
+  propagation_delay_ns: 1000
+  transport: tcp_lite              # udp (open-loop) | tcp_lite (Reno-like, RFC 6298 RTO)
+  init_cwnd: 10
+  dupack_threshold: 3              # null disables fast retransmit
+  min_rto_ms: 200
   spraying: false
-  duration_ms: 100
+  duration_ms: 100                 # simulated time limit
+  max_k: 8
+incast:
+  receiver: null                   # null -> first host of pod 0
+  block_bytes: 65536
+  rounds: 20
+  sender_placement: other-pods     # other-pods | same-pod | random
 link_capacity_gbps: 1
 trials: 30
 seed: 1
