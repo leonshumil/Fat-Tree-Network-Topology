@@ -12,6 +12,7 @@ import argparse
 import copy
 import csv
 import os
+import random
 import sys
 
 import networkx as nx
@@ -31,6 +32,11 @@ from visualize import (
     plot_e1_connectivity,
     plot_e1_layer,
     plot_e1_path_diversity,
+    plot_e2_collision_ceiling,
+    plot_e2_vs_failures,
+    plot_e3_collapse,
+    plot_e3_queue,
+    plot_e3_where_time_goes,
     plot_incast_drop_location,
     plot_incast_goodput_vs_m,
     plot_incast_queue_series,
@@ -317,6 +323,68 @@ def cmd_e1_resilience(args):
     print(f"wrote {plot_e1_layer(rows_layer, args.plot_layer)}")
 
 
+# --- e2-throughput (Phase 4, PHASE4.md Step 5) --------------------------------------------------------------------
+
+E2_SCHEMES = ["two-level", "two-level-failover", "ecmp"]
+
+
+def _e2_router(scheme, g, cfg):
+    real_scheme = "ecmp" if scheme == "ecmp" else "two-level"
+    if scheme == "two-level-failover":
+        cfg["two_level"]["failover"] = True
+    cfg["routing"] = real_scheme
+    return get_router(real_scheme, g, cfg)
+
+
+def _e2_one_trial(g, scheme, k, pct, flow_size_bytes, link_capacity_gbps, seed):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["topology"]["k"] = k
+    cfg["traffic"]["pattern"] = "random"
+    cfg["traffic"]["load"] = 1.0  # every host sends at line rate
+    cfg["traffic"]["size_model"] = "fixed"
+    cfg["traffic"]["fixed_size_bytes"] = flow_size_bytes
+    cfg["failures"] = {"link_pct": pct, "switch_pct": 0,
+                        "link_layers": ["edge-agg", "agg-core"], "switch_layers": [], "mode": "bernoulli"}
+
+    g_after, failed = apply_failures(g, cfg["failures"], seed=seed)
+    router = _e2_router(scheme, g_after, cfg)
+    router.on_failure(failed["failed_links"], failed["failed_switches"])
+    flows = generate_traffic(g, cfg, seed=seed + 1000)
+    result = simulate_flows(router, flows, link_capacity_gbps, cfg["traffic"]["load"])
+    return result["throughput_pct_of_ideal"]
+
+
+def cmd_e2_throughput(args):
+    """How much of full speed servers really get, with/without failures, and
+    how routing choice changes that -- plus, at 0% failures, how much ECMP's
+    per-flow hashing alone costs vs. the paper's Sec. 5.3 expectation."""
+    rows_fail = []
+    g = build_fat_tree(args.k)
+    for scheme in E2_SCHEMES:
+        for pct in args.pcts:
+            vals = [_e2_one_trial(g, scheme, args.k, pct, args.flow_size_bytes, args.link_capacity_gbps, args.seed + t)
+                    for t in range(args.trials)]
+            mean, ci95 = _mean_ci95(vals)
+            rows_fail.append({"scheme": scheme, "k": args.k, "link_pct": pct, "mean_pct": mean, "ci95": ci95})
+            print(f"{scheme:<18} k={args.k:>2} link_pct={pct:>4}%  throughput={mean:6.1f}% (+/- {ci95:.1f})")
+
+    rows_k = []
+    for scheme in E2_SCHEMES:
+        for k in args.ks:
+            g_k = build_fat_tree(k)
+            vals = [_e2_one_trial(g_k, scheme, k, 0, args.flow_size_bytes, args.link_capacity_gbps, args.seed + t)
+                    for t in range(args.trials)]
+            mean, ci95 = _mean_ci95(vals)
+            theory = 100 * (1 - (1 - 2 / k) ** (k // 2))
+            rows_k.append({"scheme": scheme, "k": k, "mean_pct": mean, "ci95": ci95, "theory_pct": theory})
+            print(f"{scheme:<18} k={k:>2} (0%% failures)  throughput={mean:6.1f}%% (+/- {ci95:.1f})  theory={theory:.1f}%%")
+
+    _write_csv(args.csv_failures, rows_fail)
+    _write_csv(args.csv_collision, rows_k)
+    print(f"wrote {plot_e2_vs_failures(rows_fail, E2_SCHEMES, args.plot_failures)}")
+    print(f"wrote {plot_e2_collision_ceiling(rows_k, E2_SCHEMES, args.plot_collision)}")
+
+
 # --- link-vs-switch-failures --------------------------------------------------------------------
 
 def cmd_link_vs_switch(args):
@@ -361,7 +429,9 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
     Each round is simulated as an independent flow set with fresh TCP/queue
     state (not one continuous connection reused across rounds) -- a reasonable
     model for short-lived RPC-style incast request/response bursts, the
-    classic incast benchmark setup.
+    classic incast benchmark setup. Each sender's request starts at a small
+    random offset (`incast.start_jitter_us`, seeded) rather than all exactly
+    at t=0, so the burst isn't an unrealistically perfect lockstep collision.
 
     Returns aggregate goodput, drop locations, timeouts, and round-time stats.
     """
@@ -370,6 +440,7 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
     cfg["traffic"]["incast_senders"] = m
     block_bytes = cfg["incast"]["block_bytes"]
     mtu = cfg["packet"]["mtu_bytes"]
+    start_jitter_s = cfg["incast"].get("start_jitter_us", 5) * 1e-6
     receiver = cfg["incast"].get("receiver") or hosts_of(g)[0]
     receiver_edge = next((n for n in g.neighbors(receiver) if g.nodes[n]["type"] == "edge"), None)
 
@@ -381,11 +452,13 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
     receiver_drops = 0
     max_receiver_queue = 0
     round_times_ns = []
-    receiver_queue_series = None  # (time_ns, len) samples for one representative round
+    receiver_queue_series = None    # (time_ns, len) samples for one representative round
+    receiver_drop_times_ns = None   # drop timestamps at the receiver's edge port, same round
 
     for r in range(rounds):
         pairs = generate_pairs(g, cfg, seed=seed + r)
-        flows = [Flow(src, dst, block_bytes, 0.0, "mouse") for src, dst in pairs]
+        jitter_rng = random.Random(seed + r + 500_000)
+        flows = [Flow(src, dst, block_bytes, jitter_rng.uniform(0, start_jitter_s), "mouse") for src, dst in pairs]
         sim = PacketSimulator(g, router, flows, cfg)
         result = sim.run()
 
@@ -416,6 +489,7 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
                 max_receiver_queue = max(max_receiver_queue, result["port_stats"][key].max_queue_len())
                 if r == rounds // 2:
                     receiver_queue_series = list(result["port_stats"][key].queue_len_samples)
+                    receiver_drop_times_ns = list(result["port_stats"][key].drop_times_ns)
 
     round_times_ns.sort()
     p99_round_ns = round_times_ns[min(len(round_times_ns) - 1, int(round(0.99 * (len(round_times_ns) - 1))))]
@@ -431,6 +505,7 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
         "mean_round_time_ns": sum(round_times_ns) / len(round_times_ns),
         "p99_round_time_ns": p99_round_ns,
         "receiver_queue_series": receiver_queue_series,
+        "receiver_drop_times_ns": receiver_drop_times_ns,
     }
 
 
@@ -513,6 +588,86 @@ def cmd_incast(args):
     series_row = next((r for r in topo_rows if r["topology"] == "fat-tree" and r["m"] == args.ms[-1]), None)
     if series_row and series_row["_queue_series"]:
         print(f"wrote {plot_incast_queue_series(series_row['_queue_series'], args.ms[-1], args.plot_queue)}")
+
+
+# --- e3-incast (Experiment 3, "smart": Incast -- PHASE4.md Step 6) --------------------------------------------------------------------
+
+def _e3_base_cfg(k, block_bytes, rounds, duration_ms, queue_size, min_rto_ms):
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg["topology"]["k"] = k
+    cfg["routing"] = "two-level"
+    cfg["packet"]["transport"] = "tcp_lite"
+    cfg["packet"]["queue_size_packets"] = queue_size
+    cfg["packet"]["min_rto_ms"] = min_rto_ms
+    cfg["packet"]["duration_ms"] = duration_ms
+    cfg["incast"]["block_bytes"] = block_bytes
+    cfg["incast"]["rounds"] = rounds
+    return cfg
+
+
+def cmd_e3_incast(args):
+    """Why throughput collapses when many servers answer one at once, what
+    controls the collapse point, and whether the fat-tree's full bisection
+    bandwidth helps (it doesn't: the bottleneck is the receiver's own last
+    cable, which no amount of core capacity widens)."""
+    k = args.k
+    g = build_fat_tree(k)
+    cap_bps = DEFAULTS["link_capacity_gbps"] * 1e9
+
+    # --- Figure 1: collapse vs M, one line per buffer size, min RTO 200ms ---
+    collapse_rows = []
+    for q in args.queue_sizes:
+        for m in args.ms:
+            cfg = _e3_base_cfg(k, args.block_bytes, args.rounds, args.duration_ms, q, 200)
+            router = get_router("two-level", g, cfg)
+            goodputs = [_run_incast_rounds(g, router, cfg, m, args.rounds, seed=args.seed + t * 1000)["goodput_bps"]
+                        for t in range(args.trials)]
+            mean, ci95 = _mean_ci95(goodputs)
+            collapse_rows.append({"queue_size_packets": q, "m": m,
+                                   "goodput_pct": 100 * mean / cap_bps, "goodput_ci95_pct": 100 * ci95 / cap_bps})
+            print(f"buffer={q:>3} M={m:>3}  goodput={100 * mean / cap_bps:5.1f}% (+/-{100 * ci95 / cap_bps:.1f})")
+
+    # --- Figure 2: where time goes, one buffer size, min RTO 200ms vs 1ms ---
+    time_rows = []
+    for min_rto in (200, 1):
+        for m in args.ms:
+            cfg = _e3_base_cfg(k, args.block_bytes, args.rounds, args.duration_ms, args.time_buffer, min_rto)
+            router = get_router("two-level", g, cfg)
+            round_times_ns = [_run_incast_rounds(g, router, cfg, m, args.rounds, seed=args.seed + t * 1000)["mean_round_time_ns"]
+                               for t in range(args.trials)]
+            mean_round_ns = sum(round_times_ns) / len(round_times_ns)
+            ideal_send_ns = m * args.block_bytes * 8 * 1e9 / cap_bps
+            waiting_ns = max(0.0, mean_round_ns - ideal_send_ns)
+            time_rows.append({"min_rto_ms": min_rto, "m": m,
+                               "sending_ms": ideal_send_ns / 1e6, "waiting_ms": waiting_ns / 1e6})
+            print(f"min_rto_ms={min_rto:>3} M={m:>3}  sending={ideal_send_ns / 1e6:.2f}ms waiting={waiting_ns / 1e6:.2f}ms")
+
+    # --- Figure 3: queue trace, M=2 vs M=8, one buffer size, min RTO 200ms ---
+    queue_m_values = [m for m in (2, 8) if m in args.ms] or args.ms[:2]
+    queue_traces = {}
+    for m in queue_m_values:
+        cfg = _e3_base_cfg(k, args.block_bytes, max(args.rounds, 3), args.duration_ms, args.time_buffer, 200)
+        router = get_router("two-level", g, cfg)
+        stats = _run_incast_rounds(g, router, cfg, m, max(args.rounds, 3), seed=args.seed)
+        queue_traces[m] = (stats["receiver_queue_series"], stats["receiver_drop_times_ns"])
+
+    # inset: fat-tree vs. traditional-tree goodput at one M, same buffer/RTO
+    g_tree = build_traditional_tree(k)
+    topo_goodput = {}
+    for name, g_use, router_name in (("fat-tree", g, "two-level"), ("traditional-tree", g_tree, "single-path")):
+        cfg = _e3_base_cfg(k, args.block_bytes, args.rounds, args.duration_ms, args.time_buffer, 200)
+        router = get_router(router_name, g_use, cfg)
+        vals = [_run_incast_rounds(g_use, router, cfg, args.compare_m, args.rounds, seed=args.seed + t * 1000)["goodput_bps"]
+                for t in range(args.trials)]
+        mean, _ = _mean_ci95(vals)
+        topo_goodput[name] = 100 * mean / cap_bps
+        print(f"{name:<18} M={args.compare_m}  goodput={topo_goodput[name]:5.1f}%")
+
+    _write_csv(args.csv_collapse, collapse_rows)
+    _write_csv(args.csv_time, time_rows)
+    print(f"wrote {plot_e3_collapse(collapse_rows, args.ms, args.plot_collapse)}")
+    print(f"wrote {plot_e3_where_time_goes(time_rows, args.ms, args.plot_time)}")
+    print(f"wrote {plot_e3_queue(queue_traces, args.time_buffer, topo_goodput, args.compare_m, args.plot_queue)}")
 
 
 # --- mice-elephants (Experiment 7, PHASE3_3_EXP7_MICE_ELEPHANTS.md Part A) --------------------------------------------------------------------
@@ -775,6 +930,20 @@ def main():
     pe1.add_argument("--plot-layer", default="figures/e1_layer.png")
     pe1.set_defaults(func=cmd_e1_resilience)
 
+    pe2 = sub.add_parser("e2-throughput", help="E2: speed under failures, and the hash-collision ceiling (Phase 4)")
+    pe2.add_argument("--k", type=int, default=16, help="k for the vs.-failures sweep (Part A)")
+    pe2.add_argument("--pcts", type=float, nargs="+", default=[0, 5, 10, 15, 20, 25, 30])
+    pe2.add_argument("--ks", type=int, nargs="+", default=[4, 8, 16, 24, 32], help="k values for the vs.-k sweep (Part B)")
+    pe2.add_argument("--trials", type=int, default=20)
+    pe2.add_argument("--seed", type=int, default=1)
+    pe2.add_argument("--flow-size-bytes", type=int, default=1_000_000)
+    pe2.add_argument("--link-capacity-gbps", type=float, default=1.0)
+    pe2.add_argument("--csv-failures", default="results/e2_vs_failures.csv")
+    pe2.add_argument("--csv-collision", default="results/e2_collision_ceiling.csv")
+    pe2.add_argument("--plot-failures", default="figures/e2_vs_failures.png")
+    pe2.add_argument("--plot-collision", default="figures/e2_collision_ceiling.png")
+    pe2.set_defaults(func=cmd_e2_throughput)
+
     p5 = sub.add_parser("link-vs-switch", help="link failures vs switch failures at equal %%: connectivity + path diversity")
     p5.add_argument("--k", type=int, default=16)
     p5.add_argument("--pcts", type=float, nargs="+", default=[0, 1, 2, 5, 10, 15, 20])
@@ -801,6 +970,24 @@ def main():
     p6.add_argument("--plot-timeouts", default="figures/incast_timeouts_vs_m.png")
     p6.add_argument("--plot-queue", default="figures/incast_queue_series.png")
     p6.set_defaults(func=cmd_incast)
+
+    pe3 = sub.add_parser("e3-incast", help="E3: incast -- collapse point, where time goes, queue dynamics (Phase 4)")
+    pe3.add_argument("--k", type=int, default=4)
+    pe3.add_argument("--ms", type=int, nargs="+", default=[1, 2, 4, 8, 15])
+    pe3.add_argument("--queue-sizes", type=int, nargs="+", default=[32, 64, 128])
+    pe3.add_argument("--time-buffer", type=int, default=64, help="buffer size (packets) used for figures 2 and 3")
+    pe3.add_argument("--compare-m", type=int, default=8, help="M used for the fat-tree vs. traditional-tree comparison")
+    pe3.add_argument("--rounds", type=int, default=20)
+    pe3.add_argument("--trials", type=int, default=10)
+    pe3.add_argument("--seed", type=int, default=1)
+    pe3.add_argument("--block-bytes", type=int, default=65_536)
+    pe3.add_argument("--duration-ms", type=float, default=3000)
+    pe3.add_argument("--csv-collapse", default="results/e3_collapse.csv")
+    pe3.add_argument("--csv-time", default="results/e3_where_time_goes.csv")
+    pe3.add_argument("--plot-collapse", default="figures/e3_collapse.png")
+    pe3.add_argument("--plot-time", default="figures/e3_where_time_goes.png")
+    pe3.add_argument("--plot-queue", default="figures/e3_queue.png")
+    pe3.set_defaults(func=cmd_e3_incast)
 
     p7 = sub.add_parser("mice-elephants", help="Experiment 7: FCT/slowdown of mice vs elephants, by routing scheme")
     p7.add_argument("--k", type=int, default=4)

@@ -54,6 +54,8 @@ DEFAULTS = {
         "block_bytes": 65_536,
         "rounds": 20,
         "sender_placement": "other-pods",  # other-pods | same-pod | random
+        "start_jitter_us": 5,           # each sender's request starts at a random offset in
+                                         # [0, start_jitter_us] -- avoids an unrealistic exact-lockstep burst
     },
     "link_capacity_gbps": 1,
     "trials": 30,

@@ -9,3 +9,6 @@ venv/
 # Local notes and Claude Code prompts: keep on this computer, do not upload
 *.md
 !README.md
+
+# Assignment/reference PDFs: keep on this computer, do not upload
+*.pdf

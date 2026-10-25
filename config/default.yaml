@@ -54,6 +54,7 @@ incast:
   block_bytes: 65536
   rounds: 20
   sender_placement: other-pods     # other-pods | same-pod | random
+  start_jitter_us: 5               # each sender starts at a random offset in [0, start_jitter_us]
 link_capacity_gbps: 1
 trials: 30
 seed: 1

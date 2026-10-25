@@ -622,6 +622,194 @@ def plot_e1_layer(rows, out_path):
     return out_path
 
 
+# --- Phase 4, E2: Throughput (PHASE4.md Steps 3, 5) --------------------------------------------------------------------
+
+def plot_e2_vs_failures(rows, schemes, out_path):
+    """Throughput (% of ideal) vs. link failure %, one line per scheme.
+    Annotates the gap between two-level and ecmp at the highest failure %."""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for scheme in schemes:
+        s_rows = sorted((r for r in rows if r["scheme"] == scheme), key=lambda r: r["link_pct"])
+        pcts = [r["link_pct"] for r in s_rows]
+        means = [r["mean_pct"] for r in s_rows]
+        cis = [r["ci95"] for r in s_rows]
+        ax.errorbar(pcts, means, yerr=cis, fmt="o-", capsize=3, color=SCHEME_COLORS.get(scheme), label=scheme)
+
+    by_scheme = {s: {r["link_pct"]: r["mean_pct"] for r in rows if r["scheme"] == s} for s in schemes}
+    max_pct = max(r["link_pct"] for r in rows)
+    if "two-level" in by_scheme and "ecmp" in by_scheme and max_pct in by_scheme["two-level"]:
+        y_lo = by_scheme["two-level"][max_pct]
+        y_hi = by_scheme["ecmp"][max_pct]
+        ax.annotate("", xy=(max_pct, y_hi), xytext=(max_pct, y_lo),
+                    arrowprops=dict(arrowstyle="<->", color="black", lw=1))
+        ax.text(max_pct - 2, (y_lo + y_hi) / 2, f"{y_hi - y_lo:.0f} pt gap", fontsize=9, ha="right")
+
+    ax.set_xlabel("link failure % (bernoulli, fabric links)")
+    ax.set_ylabel("throughput (% of ideal)")
+    ax.set_ylim(0, 105)
+    ax.set_title("Static routing tables lose the most as links fail")
+    ax.legend(frameon=False, fontsize=9)
+    _no_top_right_spines(ax)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_e2_collision_ceiling(rows, schemes, out_path):
+    """Throughput (% of ideal) at 0% failures vs. k, one line per scheme, a
+    100% reference line, and the analytic per-hop random-hashing estimate
+    1 - (1-2/k)^(k/2) dashed."""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ks = sorted({r["k"] for r in rows})
+    theory = [next(r["theory_pct"] for r in rows if r["k"] == k) for k in ks]
+    ax.plot(ks, theory, "--", color="black", alpha=0.7, label="theory: 1-(1-2/k)^(k/2)")
+    ax.axhline(100, color="gray", linestyle=":", linewidth=1)
+    for scheme in schemes:
+        s_rows = sorted((r for r in rows if r["scheme"] == scheme), key=lambda r: r["k"])
+        means = [r["mean_pct"] for r in s_rows]
+        cis = [r["ci95"] for r in s_rows]
+        ax.errorbar(ks, means, yerr=cis, fmt="o-", capsize=3, color=SCHEME_COLORS.get(scheme), label=scheme)
+
+    ax.annotate("full bisection bandwidth promises 100%", xy=(ks[-1], 100), xytext=(ks[-1] - 6, 88),
+                fontsize=9, arrowprops=dict(arrowstyle="->", color="gray", lw=1))
+    ax.set_xlabel("switch port count k")
+    ax.set_ylabel("throughput at 0% failures (% of ideal)")
+    ax.set_ylim(0, 110)
+    ax.set_title("Hash collisions waste about half the capacity, even with no failures")
+    ax.legend(frameon=False, fontsize=9)
+    _no_top_right_spines(ax)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# --- Phase 4, E3: Incast (PHASE4.md Steps 3, 6) --------------------------------------------------------------------
+
+def plot_e3_collapse(rows, ms, out_path, init_cwnd=10):
+    """Goodput (% of receiver line rate) vs. number of senders M, one line
+    per buffer size, min RTO 200ms. Annotates each buffer's collapse point
+    and the analytic estimate M* ~= buffer / (2*init_cwnd)."""
+    queue_sizes = sorted({r["queue_size_packets"] for r in rows})
+    colors = plt.cm.viridis([i / max(1, len(queue_sizes) - 1) for i in range(len(queue_sizes))])
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for color, q in zip(colors, queue_sizes):
+        q_rows = sorted((r for r in rows if r["queue_size_packets"] == q), key=lambda r: r["m"])
+        xs = [r["m"] for r in q_rows]
+        ys = [r["goodput_pct"] for r in q_rows]
+        cis = [r["goodput_ci95_pct"] for r in q_rows]
+        ax.errorbar(xs, ys, yerr=cis, fmt="o-", capsize=3, color=color, label=f"buffer={q}")
+
+        m_star = q / (2 * init_cwnd)
+        ax.axvline(m_star, color=color, linestyle=":", linewidth=1, alpha=0.6)
+        collapse_m = next((r["m"] for r in q_rows if r["goodput_pct"] < 50), None)
+        if collapse_m is not None:
+            ax.annotate(f"buffer={q} collapses\nat M={collapse_m}", xy=(collapse_m, 50),
+                        xytext=(collapse_m + 1.5, 60 + 8 * queue_sizes.index(q)),
+                        fontsize=8, color=color, arrowprops=dict(arrowstyle="->", color=color, lw=1))
+
+    ax.set_xlabel("number of senders M")
+    ax.set_ylabel("goodput (% of receiver line rate)")
+    ax.set_ylim(0, 105)
+    ax.set_title("A bigger buffer only delays the incast collapse")
+    ax.legend(frameon=False, fontsize=9)
+    _no_top_right_spines(ax)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_e3_where_time_goes(rows, ms, out_path):
+    """Stacked bars per M: average round time split into sending data vs.
+    waiting for timeouts, min RTO 200ms and 1ms side by side."""
+    rtos = [200, 1]
+    rto_colors = {200: "#d00000", 1: "#52b69a"}  # "waiting" color per RTO group
+    send_color = "#2a6f97"
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    x = range(len(ms))
+    for i, rto in enumerate(rtos):
+        rto_rows = {r["m"]: r for r in rows if r["min_rto_ms"] == rto}
+        sending = [rto_rows[m]["sending_ms"] for m in ms]
+        waiting = [rto_rows[m]["waiting_ms"] for m in ms]
+        offsets = [xi + (i - 0.5) * width for xi in x]
+        ax.bar(offsets, sending, width, color=send_color, label="sending data" if i == 0 else None)
+        ax.bar(offsets, waiting, width, bottom=sending, color=rto_colors[rto],
+               label=f"waiting (min RTO {rto}ms)")
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels([f"M={m}" for m in ms])
+    ax.set_ylabel("mean round time (ms)")
+    ax.set_title("A 200ms timeout costs far more than the data itself ever takes to send")
+    ax.legend(frameon=False, fontsize=9)
+    _no_top_right_spines(ax)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_e3_queue(queue_traces, buffer, topo_goodput, compare_m, out_path):
+    """Queue length at the receiver's edge port over one round, for two M
+    values, with the buffer limit as a horizontal line and drops marked
+    with x. Adds a text box comparing fat-tree vs. traditional-tree
+    goodput at `compare_m` (the bottleneck is the receiver's last cable,
+    which neither topology's core richness changes)."""
+    colors = {}
+    ms = sorted(queue_traces)
+    palette = ["#2a6f97", "#d00000", "#52b69a", "#f4a259"]
+    for i, m in enumerate(ms):
+        colors[m] = palette[i % len(palette)]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    drain_times_ms = []
+    for m in ms:
+        series, drop_times_ns = queue_traces[m]
+        if not series:
+            continue
+        times_ms = [t / 1e6 for t, _ in series]
+        lens = [n for _, n in series]
+        ax.step(times_ms, lens, where="post", color=colors[m], label=f"M={m}")
+        if drop_times_ns:
+            ax.scatter([t / 1e6 for t in drop_times_ns], [buffer] * len(drop_times_ns),
+                       marker="x", color=colors[m], s=40, zorder=3)
+        # the burst fills and drains in the first ms or two; the rest of the
+        # round (often 100s of ms of RTO wait, see e3_where_time_goes) is a
+        # flat empty queue that would otherwise swamp the interesting part
+        peak_idx = max(range(len(lens)), key=lambda i: lens[i])
+        drain_idx = next((i for i in range(peak_idx, len(lens)) if lens[i] == 0), len(lens) - 1)
+        drain_times_ms.append(times_ms[drain_idx])
+
+    ax.axhline(buffer, color="gray", linestyle="--", linewidth=1, label=f"buffer limit ({buffer} packets)")
+    if drain_times_ms:
+        ax.set_xlim(0, max(drain_times_ms) * 1.3)
+    ax.set_xlabel("time (ms)")
+    ax.set_ylabel("queue length (packets)")
+    ax.set_title("You can see the buffer fill and overflow")
+    ax.legend(frameon=False, fontsize=9)
+    _no_top_right_spines(ax)
+
+    if topo_goodput:
+        lines = [f"{name}: {pct:.1f}%" for name, pct in topo_goodput.items()]
+        text = f"goodput at M={compare_m}:\n" + "\n".join(lines) + "\n(bottleneck: receiver's last cable)"
+        ax.text(0.98, 0.95, text, transform=ax.transAxes, ha="right", va="top", fontsize=8,
+                bbox=dict(boxstyle="round", facecolor="white", edgecolor="gray", alpha=0.9))
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Draw a fat-tree topology diagram")
     p.add_argument("-c", "--config", default=None, help="path to YAML config")

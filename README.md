@@ -2,142 +2,85 @@
 
 Homework 1, course 361.2.2460 — Data Center & AI Networking (BGU, semester A 2026/27).
 
-Implements and analyzes a three-tier fat-tree data center topology, consistent with:
+Three findings drive this submission: (1) a fat-tree's survival under random failures is
+governed almost exactly by simple closed-form formulas, and bigger `k` buys
+disproportionately more fault tolerance; (2) even with **zero** failures, per-flow hash
+routing (ECMP/two-level) wastes roughly half of the network's promised bisection
+bandwidth to hash collisions — a real gap from the paper's own Sec. 5.3 expectation, and
+the exact motivation for the same authors' later Hedera scheduler; (3) incast collapses
+abruptly at a predictable number of senders, and the cause is almost entirely a 200ms
+TCP timeout, not a lack of bisection bandwidth — the fat-tree's rich core does essentially
+nothing to help, because the bottleneck is the receiver's own last cable.
 
 > M. Al-Fares, A. Loukissas, A. Vahdat, "A Scalable, Commodity Data Center Network
 > Architecture," SIGCOMM Comput. Commun. Rev., vol. 38, no. 4, pp. 63–74, Oct. 2008,
 > doi:[10.1145/1402946.1402967](https://doi.org/10.1145/1402946.1402967).
 
-## Approach
+## The topology
 
-A **graph/flow-level simulation**, not a packet-level emulator like the paper's own
-Click-based evaluation — most experiments here use a graph-only or max-min-fair flow
-model for speed at large `k`. A genuine discrete-event **packet-level** engine also
-exists (`fattree/sim/packet.py`) for small-`k` micro-behavior questions — see
-[Simulation levels](#simulation-levels). Built on [networkx](https://networkx.org/):
-switches/hosts are graph nodes, links are edges, failures are node/edge removal.
+A `k`-ary fat-tree (paper Sec. 3): `k` pods, each with `k/2` edge and `k/2` aggregation
+switches (complete bipartite within the pod), `(k/2)²` core switches each wired to every
+pod via one specific "row." Built in `fattree/topology.py` on top of
+[networkx](https://networkx.org/) — switches/hosts are graph nodes, links are edges,
+failures are node/edge removal — with the paper's own IP addressing scheme (Sec. 3.2),
+verified against its Fig. 3 worked example. `topology.type` also accepts
+`traditional-tree`: one agg switch per pod and a single global core switch (same host
+count, zero redundancy above the edge layer), used as the non-fat-tree comparison in
+[Experiment 3](#experiment-3-incast).
 
-The topology generator (`fattree/topology.py`) reproduces the paper's three-tier
-structure and IP addressing (Sec. 3.2), including the agg-to-core-row rule and the
-Fig. 3 worked example (`tests/test_topology.py`). Traffic patterns (`fattree/traffic.py`),
-five routing schemes including the paper's actual two-level algorithm (`fattree/routing/`),
-and three simulation engines (`fattree/sim/`) are layered on top.
+| | formula | k=4 | k=8 | k=16 |
+|---|---|---|---|---|
+| hosts | k³/4 | 16 | 128 | 1024 |
+| switches | 5k²/4 | 20 | 80 | 320 |
+| links per layer | k³/4 | 16 | 128 | 1024 |
+| core switches | (k/2)² | 4 | 16 | 64 |
+| bisection width | k³/8 | 8 | 64 | 512 |
+| hop count | 2 / 4 / 6 | same-edge / same-pod / cross-pod |
 
-## Repository layout
-
-```
-fattree/
-  topology.py    # build k-ary fat-tree + traditional tree, paper addressing, validate()
-  failures.py    # link + switch failures, per layer, exact/bernoulli, fixed or randomized pct
-  config.py      # config loading, defaults, validation
-  metrics.py     # switches-with-failed-links metric + closed-form theory
-  traffic.py     # 8 traffic patterns (paper Sec. 5.2) + flow-size/class models
-  routing/       # single-path, ecmp, two-level (paper Alg. 1/2), classifier (Alg. 3), scheduler
-  sim/
-    graph.py          # structure-only connectivity/path metrics (edge-switch aggregation trick)
-    flow.py           # max-min fair rate allocation (progressive filling)
-    packet.py         # discrete-event packet simulator engine, k <= 8 only
-    transport.py      # udp (open-loop) and tcp_lite (Reno-like, RFC 6298 RTO) state machines
-    packet_metrics.py # per-packet/flow/port stats, RFC 4737 reordering
-config/default.yaml   # one scenario
-run.py           # CLI: build a topology, apply failures, print a summary
-visualize.py     # CLI: topology diagram, failure summary chart, experiment plots
-analysis.py      # CLI: experiment subcommands -> results/*.csv + figures/*.png
-figures/ results/ tests/
-```
-
-Not built: the `web/` GitHub Pages interactive site, and 3 of 9 planned experiments —
-see [Not done / future work](#not-done--future-work).
-
-## Topology diagram
-
-```bash
-python visualize.py --k 8 --link-pct 5 --seed 1 --out figures/topology_k8_failures.png
-python visualize.py --k 4 --no-failures --out figures/topology_k4_clean.png
-```
-
-Layers (core/agg/edge/host) stacked top to bottom, pods grouped left to right. Failed
-links are dashed red; failed switches marked with a red ×.
-
-`k=4`, no failures (matches the paper's Fig. 3 worked example):
+`k=4`, no failures (matches the paper's Fig. 3):
 
 ![k=4 fat-tree, no failures](figures/topology_k4_clean.png)
 
-`k=8`, 5% of edge-agg/agg-core links failed (seed 1, exact mode — 13 of 256 eligible links):
+`k=8` traditional tree, 5% link failures — one failed edge-agg link isolates an entire
+edge switch's hosts (no redundant path exists, unlike the fat-tree):
 
-![k=8 fat-tree, 5% link failures](figures/topology_k8_failures.png)
-
-`visualize.py` also writes a small summary chart: link status pie + before/after
-switch/link counts, labeled with the resolved failure percentages:
-
-![k=8 failure summary: link status pie and before/after bar chart](figures/summary_k8_failures.png)
-
-## Traditional tree (comparison baseline)
-
-`topology.type` (`--topology-type`) also accepts `traditional-tree`: a conventional,
-oversubscribed 3-tier tree with the *same host count* as the fat-tree (paper Sec. 2 /
-Fig. 1) — one agg switch per pod, one core switch total, so there is exactly **one**
-path between any two hosts instead of the fat-tree's `(k/2)²` parallel core paths. Hop
-counts are identical (2/4/6 for same-edge/same-pod/cross-pod) — redundancy differs, not
-path length.
+![k=8 traditional tree, 5% link failures](figures/topology_traditional_k8.png)
 
 ```bash
+python visualize.py --k 8 --link-pct 5 --seed 1 --out figures/topology_k8.png
 python visualize.py --k 8 --topology-type traditional-tree --link-pct 5 --seed 1 \
-    --out figures/topology_traditional_k8.png --summary-out figures/summary_traditional_k8.png
+    --out figures/topology_traditional_k8.png
 ```
 
-![k=8 traditional tree, 5% link failures — one failed edge-agg link isolates an entire edge switch's hosts](figures/topology_traditional_k8.png)
+## Install & run
 
-![k=8 traditional tree failure summary: link status pie and before/after bar chart](figures/summary_traditional_k8.png)
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python -m pytest tests/ -v          # 198 tests
 
-With only 5% of links failed, a single unlucky edge-agg link (dashed red) cuts off an
-entire edge switch's hosts — the fat-tree barely notices the same failure rate, since
-every edge/agg switch has `k/2` parallel uplinks
-(`tests/test_topology.py::test_traditional_tree_has_no_redundant_paths` checks this directly).
+# Experiment 1: Resilience -- what breaks, and how much it matters
+python analysis.py e1-resilience --ks 8 16 32 \
+    --pcts 0 5 10 15 20 25 30 35 40 45 50 55 60 --trials 30 \
+    --layer-k 16 --switch-pcts 5 10
 
-## Routing schemes
+# Experiment 2: Speed under failures, and the hash-collision ceiling
+python analysis.py e2-throughput --k 16 --pcts 0 5 10 15 20 25 30 \
+    --ks 4 8 16 24 32 --trials 20
 
-`fattree/routing/` implements five schemes behind one `Router` interface
-(`route(flow)`, `on_failure(...)`, `stats()`):
+# Experiment 3: Incast
+python analysis.py e3-incast --ms 1 2 4 8 15 --queue-sizes 32 64 128 \
+    --time-buffer 64 --compare-m 8 --rounds 20 --trials 10
+```
 
-- **single-path** — one fixed shortest path per destination, never recomputed; a
-  failure on that path drops the flow (OSPF-like baseline, no multi-path diversity).
-- **ecmp** — hashes each flow onto one of the currently available equal-cost shortest
-  paths; recomputes live on the post-failure graph every call, so it reroutes automatically.
-- **two-level** — the paper's actual algorithm (Sec. 3.3–3.5, Alg. 1 & 2, with the
-  documented destination-pod typo in Alg. 2 fixed). Real prefix/suffix forwarding
-  tables per switch; the agg→core port wiring was reverse-engineered from the paper's
-  own worked example and verified exactly
-  (`tests/test_routing.py::test_two_level_matches_paper_fig3_example`). Static by
-  default (`two_level.failover: false`, matching the paper's Sec. 3.1 critique);
-  `failover: true` approximates Sec. 3.8's reroute-when-a-choice-exists behavior.
-- **classifier** — Alg. 3: new flows go to the least-loaded upward port; periodically,
-  up to `classifier.max_moves` flows move from the busiest to the idlest port.
-- **scheduler** — Sec. 3.7/4.3: a central scheduler reserves one of the `(k/2)²`
-  inter-pod core paths (or `k/2` intra-pod agg paths) per elephant flow
-  (`traffic.elephant_threshold_bytes`); mice use two-level.
-
-## Simulation levels
-
-`simulation.level` trades fidelity for speed — a full packet simulation at `k=48`
-(27,648 hosts) isn't tractable with a Python discrete-event loop, so each experiment
-uses the cheapest level that still answers its question:
-
-- **graph** — structure only, no traffic/routing. `k=48` in under a second via an
-  edge-switch aggregation trick (`fattree/sim/graph.py`). Used for
-  `critical_failure_pct_vs_k`, `link_vs_switch`. No notion of load/capacity/congestion.
-- **flow** — routes every flow, then max-min fair rates (progressive filling) over link
-  capacities. No queueing. Used for `table2_reproduction`, `throughput_vs_failures`.
-- **packet** — genuine discrete-event sim, integer-ns clock, FIFO drop-tail queues,
-  `udp` open-loop or `tcp_lite` Reno-like transport (RFC 6298 RTO), `k ≤ 8` only (slowest
-  engine by orders of magnitude). Used for [Incast](#experiment-9-incast) and
-  [Mice vs. elephants](#experiment-7-mice-vs-elephants); exercised by
-  `tests/test_packet_sim.py`'s 13 validation tests. No SACK, no delayed ACKs, no ECN,
-  simplified fast recovery.
+Each writes `results/eN_*.csv` + `figures/eN_*.png`. See
+[Other analyses available in the code](#other-analyses-available-in-the-code) for
+additional subcommands not part of this submission's presented results.
 
 ## Input parameters
 
-Set via `config/default.yaml` (or any `-c <path>`), overridable on the command line.
+Set via `config/default.yaml` (or `config/experiments/e{1,2,3}_*.yaml`, which document
+each experiment's fixed parameters), overridable on the command line.
 
 | Parameter | Config path | CLI flag | Default | Meaning |
 |---|---|---|---|---|
@@ -148,51 +91,211 @@ Set via `config/default.yaml` (or any `-c <path>`), overridable on the command l
 | Switch failure % | `failures.switch_pct` | `--switch-pct` / `--switch-pct-range MIN MAX` | 0 | Same, for switches (removes incident links too). |
 | Failure mode | `failures.mode` | `--mode` | `exact` | `exact` = `round(pct·N)` chosen without replacement; `bernoulli` = independent per-element probability `p`. |
 | Traffic pattern | `traffic.pattern` | `--pattern` | `random` | 8 patterns (Sec. 5.2) — see `fattree/traffic.py`. |
-| Flow size model | `traffic.size_model` | — | `mice-elephants` | `fixed \| mice-elephants \| empirical`. |
 | Offered load | `traffic.load` | `--load` | 1.0 | Each host sends at `load × link rate`. |
-| Routing scheme | `routing` | `--routing` | `two-level` | See [Routing schemes](#routing-schemes). |
-| Simulation level | `simulation.level` | — | `flow` | `graph \| flow \| packet` (packet only `k ≤ 8`). |
+| Routing scheme | `routing` | `--routing` | `two-level` | `single-path \| ecmp \| two-level \| classifier \| scheduler`. |
+| Simulation level | `simulation.level` | — | `flow` | `graph \| flow \| packet` (packet only `k ≤ 8`) — see below. |
 | Random seed | `seed` | `--seed` | 1 | Trial `t` uses `seed + t`. |
 | Trials per point | `trials` | `--trials` | 30 | Repetitions for sweeps. |
 
 Config/CLI are validated with explicit errors (`fattree/config.py`). The full schema
-(20+ more keys: `subnet_p`, `incast_senders`, `elephant_fraction`, `two_level.failover`,
-`classifier.max_moves`, `packet.*`, ...) is documented inline in `config/default.yaml`.
+(`incast.*`, `packet.*`, `classifier.*`, ...) is documented inline in
+`config/default.yaml` and `config/experiments/*.yaml`.
 
-## Install & run
+## Simulation levels
+
+`simulation.level` trades fidelity for speed — a full packet simulation at `k=48`
+(27,648 hosts) isn't tractable with a Python discrete-event loop, so each experiment
+uses the cheapest level that still answers its question:
+
+- **graph** (`fattree/sim/graph.py`) — structure only, no traffic/routing; `k=48` in
+  under a second via an edge-switch aggregation trick. **Used by Experiment 1**, which
+  only asks "are these two hosts still connected," not "how fast."
+- **flow** (`fattree/sim/flow.py`) — routes every flow, then computes max-min fair rates
+  (progressive filling) over link capacities; no queueing. **Used by Experiment 2**,
+  which needs real contention/sharing behavior at `k` up to 32 — intractable at the
+  packet level, but flow level answers "how much throughput" exactly.
+- **packet** (`fattree/sim/packet.py`) — genuine discrete-event simulation,
+  integer-nanosecond clock, FIFO drop-tail queues, `tcp_lite` (Reno-like, RFC 6298 RTO,
+  RFC 5681 go-back-N recovery), restricted to `k ≤ 8`. **Used by Experiment 3**, which is
+  specifically about queueing, drops, and timeouts — none of which graph or flow level
+  can represent at all.
+
+## Results
+
+### Experiment 1: Resilience — what breaks, and how much it matters
+
+**Question.** When random parts of the network fail, when do servers lose contact with
+each other, and does it matter *which layer* fails?
+
+**Setup.** Part A: `k ∈ {8,16,32}`, link failure % ∈ `{0,5,...,60}` (bernoulli, fabric
+links only), 30 trials/point — fraction of host pairs connected (`fattree/sim/graph.py`)
+and inter-pod path diversity (surviving shortest paths / `(k/2)²`), each against a
+theory curve. Part B: `k=16` fixed, 5%/10% switch failure in *one* layer at a time
+(edge-only / agg-only / core-only), 30 trials.
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-python run.py -c config/default.yaml                              # default scenario
-python run.py -c config/default.yaml --k 16 --link-pct 10          # override params
-python run.py -c config/default.yaml --link-pct-range 0 20 --seed 7  # randomized pct
-python run.py -c config/default.yaml --topology-type traditional-tree
-python run.py -c config/default.yaml --json                        # machine-readable
-
-python visualize.py -c config/default.yaml --out figures/topology.png --summary-out figures/summary.png
-
-# experiments (see Results below for each one's write-up)
-python analysis.py switches-multifail --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1
-python analysis.py critical-failure-pct --ks 4 8 16 24 32 --trials 10
-python analysis.py table2 --k 4 --trials 15
-python analysis.py throughput-vs-failures --ks 8 16 --pcts 0 5 10 15 20 25 30 --trials 15
-python analysis.py link-vs-switch --k 16 --pcts 0 1 2 5 10 15 20 --trials 15
-python analysis.py incast --k 4 --ms 1 2 4 8 15 --queue-sizes 32 64 128 --rounds 10 --trials 5
-python analysis.py mice-elephants --k 4 --loads 0.3 0.5 0.7 --trials 3
+python analysis.py e1-resilience --ks 8 16 32 --pcts 0 5 ... 60 --trials 30
 ```
 
-Example output:
+![Bigger fat-trees survive far more broken links: connectivity vs. link failure %, one line per k, with the 1-2p^(k/2) theory curve dashed](figures/e1_connectivity.png)
 
+**Discussion.** The theory curve `1 - 2p^(k/2)` — a server is cut off only once *all*
+`k/2` uplinks of its edge switch fail — tracks the simulation closely at every `k`.
+`k=8` drops below 99.9% connectivity at just 15% link failure; `k=16` survives to 45%;
+`k=32` never drops below 99.9% anywhere in the tested range (still 99.95% connected at
+60% failure). This is the central resilience argument for higher-radix fat-trees: a
+server's isolation probability falls *exponentially* in `k/2`, so each doubling of port
+count buys a dramatically larger safe operating range, not just more hosts.
+
+![Redundancy erodes long before connectivity is lost: surviving inter-pod paths / (k/2)^2 vs. link failure %, with the (1-p)^4 theory curve](figures/e1_path_diversity.png)
+
+**Discussion.** Path diversity (a path survives only if all 4 of its fabric links
+survive, hence `(1-p)^4`) collapses far faster than connectivity: half of the `(k/2)²`
+inter-pod paths are already gone by ~16-20% link failure — well before any of the three
+`k` values has lost a single percentage point of connectivity. This is the mechanism
+*behind* the first figure: the fat-tree stays connected long after it has stopped being
+genuinely redundant, because losing most of the parallel paths between two pods still
+leaves at least one.
+
+![An edge failure cuts off its own servers; core/agg barely touch connectivity: % of server pairs disconnected by failed-switch layer, k=16](figures/e1_layer.png)
+
+**Discussion.** At `k=16`, failing 5%/10% of *edge* switches disconnects 10.8%/20.2% of
+server pairs (close to the `2x` relationship expected from "a pair is disconnected if
+either endpoint is isolated," since each lost edge switch directly orphans its own
+hosts) — while failing the *same percentage* of agg or core switches disconnects
+**exactly 0%** of pairs, because every agg/core switch has `k/2` redundant peers the
+fat-tree can route around instantly. Layer matters enormously more than raw failure
+percentage; a monitoring policy that only tracks "% of switches down" without knowing
+which layer is blind to the one failure mode that actually costs connectivity.
+**Limitation:** this experiment measures connectivity only, not bandwidth — a fully
+connected network can still be badly congested, which is exactly what Experiment 2 covers.
+
+### Experiment 2: Speed under failures, and the hash-collision ceiling
+
+**Question.** How much of full line-rate speed do servers actually get, with and
+without failures, and how much does the routing scheme change that?
+
+**Setup.** Flow level (max-min fair), random permutation traffic, every host sending at
+line rate, fixed flow size. Three schemes: two-level (paper), two-level with
+`failover: true`, and ECMP. Part A: `k=16`, link failure % ∈ `{0,5,...,30}`, 20 trials.
+Part B: 0% failures, `k ∈ {4,8,16,24,32}`, 20 trials.
+
+```bash
+python analysis.py e2-throughput --k 16 --pcts 0 5 ... 30 --ks 4 8 16 24 32 --trials 20
 ```
-Topology: fat-tree, k=8
-  hosts:    128
-  switches: 80
-  links:    384
-  failures: 0 switches, 3 links (link_pct=1%, switch_pct=0%, exact mode)
-  after failure: 80 switches, 381 links
+
+![Static routing tables lose the most as links fail: throughput (% of ideal) vs. link failure %, one line per scheme, k=16](figures/e2_vs_failures.png)
+
+**Discussion.** All three schemes decline as links fail, but at very different rates.
+**Plain two-level degrades fastest** (46.5%→17.3%, a 62.8% relative drop): its tables are
+static, so a flow whose fixed hop crosses a failed link is simply dropped rather than
+rerouted. **ECMP degrades slowest** (42.8%→34.5%, only 19.4% relative): it recomputes
+shortest paths live on every call, so it reroutes around a failure automatically
+whenever an equal-cost alternative survives. **Enabling `two_level.failover`** recovers
+much of the gap (22.8% vs. 17.3% at 30% failure, a 5.5-point recovery) by retrying
+another live upward port instead of dropping outright — direct, quantitative support for
+the paper's own Sec. 3.8 motivation for adding failover to an otherwise-static scheme.
+
+![Hash collisions waste about half the capacity, even with no failures: throughput at 0% failures vs. k, one line per scheme, with the random-hashing theory curve dashed](figures/e2_collision_ceiling.png)
+
+**Discussion.** Even at **0% failures**, no scheme gets close to the 100% full
+bisection bandwidth promises. ECMP achieves only 56.6% at `k=4`, falling to 40.9% at
+`k=32`; two-level does somewhat better (64.4%→44.7%, since its ID-based deterministic
+placement happens to spread a full permutation's load slightly more evenly than ECMP's
+independent random hash per flow) — and `two-level` with `failover` is numerically
+**identical** to plain `two-level` here, exactly as expected, since failover only
+changes behavior when something is actually broken. The analytic reference curve
+`1 - (1-2/k)^(k/2)` — the expected fraction of upward ports used when `k/2` flows hash
+independently onto `k/2` ports *at one switch* — sits visibly *above* every measured
+curve (75.0%→64.4%), because real routing compounds collisions across **multiple**
+independent hash stages (edge→agg, then agg→core) along a path, not just one. An
+independent re-implementation (`tests/test_e2_throughput.py`, using networkx's own path
+enumeration and a freshly-written max-min solver, no shared code with
+`fattree/routing`/`fattree/sim/flow`) reproduces `k=8`'s ~47% within statistical noise,
+confirming this isn't a pipeline bug. This is a direct, quantitative contradiction of
+the paper's own Sec. 5.3 expectation that collisions would be rare, and it is exactly
+the gap the same authors' later paper, Hedera (NSDI 2010), built a central flow
+scheduler to close.
+
+### Experiment 3: Incast
+
+**Question.** When many servers answer one server at nearly the same moment
+(partition/aggregate — a search fan-out, an AI all-reduce), why does throughput
+collapse, what actually controls the collapse point, and does the fat-tree's full
+bisection bandwidth help at all?
+
+**In one number.** 8 senders × 64 KB = 512 KB arriving at a 96 KB (64-packet) receiver
+buffer. Sending that much data at line rate takes only ~4.2ms — but one lost packet
+means a 200ms minimum RTO wait. 4.2 / (4.2 + 200) ≈ 2% goodput, and that is almost
+exactly what was measured (1.8%).
+
+**Setup.** Packet level, `tcp_lite` (fixed in this submission, see
+[Limitations](#limitations)), `k=4`, `M ∈ {1,2,4,8,15}` senders, 64 KB block per sender
+per round, 20 barrier-synchronized rounds, 10 trials, buffer ∈ `{32,64,128}` packets,
+min RTO ∈ `{200ms, 1ms}`, each sender's request jittered by a few random microseconds
+(`incast.start_jitter_us`) so the burst isn't an unrealistic perfect lockstep collision.
+
+```bash
+python analysis.py e3-incast --ms 1 2 4 8 15 --queue-sizes 32 64 128 \
+    --time-buffer 64 --compare-m 8 --rounds 20 --trials 10
 ```
+
+![A bigger buffer only delays the incast collapse: goodput (% of receiver line rate) vs. number of senders M, one line per buffer size, min RTO 200ms](figures/e3_collapse.png)
+
+**Discussion.** Textbook incast collapse, and the collapse point is predictable: after
+one RTT of slow start a sender's window is `2 × init_cwnd` (= 20 packets here), so a
+buffer overflows once `M × 2 × init_cwnd` exceeds it, i.e. `M* ≈ buffer / (2×init_cwnd)`
+— `32→1.6`, `64→3.2`, `128→6.4`. The measured collapse lands at **M=2, 4, 8** for
+buffers 32, 64, 128 respectively — matching the rounded-up analytic estimate exactly. A
+bigger buffer doesn't prevent collapse, it only moves the cliff to a larger `M`.
+
+![A 200ms timeout costs far more than the data itself ever takes to send: mean round time split into sending data vs. waiting for timeouts, buffer=64, min RTO 200ms vs. 1ms](figures/e3_where_time_goes.png)
+
+**Discussion.** At `M=8`, sending the data itself takes 4.2ms — but with a 200ms
+minimum RTO, the *mean round time* is 230ms, i.e. **226ms of pure timeout waiting**.
+Dropping the minimum RTO to 1ms cuts that same round's waiting time to under 2ms — a
+>100x reduction — with send time completely unchanged, because the data was never the
+problem. This is a direct, quantitative reproduction of Vasudevan et al.'s (SIGCOMM
+2009) central claim: the 200ms RTO floor is a wide-area-network TCP default, wildly
+mismatched to a sub-millisecond datacenter RTT, and most of incast's cost is a *timer*
+problem, not a *capacity* problem.
+
+![You can see the buffer fill and overflow: queue length at the receiver's edge port over one round, M=2 vs. M=8, buffer=64, drops marked with x](figures/e3_queue.png)
+
+**Discussion.** At `M=2` the queue never reaches the 64-packet buffer limit and drains
+cleanly in about 1ms. At `M=8`, the queue fills to the buffer limit within ~0.8ms,
+plateaus (new arrivals are dropped the instant anything leaves, visible as the `x`
+marker), and only drains ~1.3ms later once the senders' windows have collapsed — the
+entire fill-plateau-drain cycle takes under 3ms, dwarfed by the 200ms timeout that
+follows it (not shown on this zoomed-in panel; see the previous figure). The inset
+compares fat-tree vs. traditional-tree goodput at `M=8`: **1.8% vs. 1.8%, identical**.
+The fat-tree's richer core does not help at all, because the bottleneck was never the
+core — it is the receiver's own single last-hop cable, which has exactly the same
+capacity regardless of how many parallel paths exist upstream of it.
+
+**Real-world fixes** this motivates (not implemented here): bigger receiver buffers
+(delays but doesn't prevent collapse, per above), a much smaller RTO (the direct fix
+demonstrated here), DCTCP-style ECN marking to signal congestion before a drop is
+needed at all, or receiver-driven transport protocols (Homa, NDP) that sidestep the
+sender-paced-retransmission model entirely.
+
+## Limitations
+
+- **`tcp_lite` is not real TCP.** No SACK (a receiver can only signal "give me
+  everything from this sequence number on," not "I'm specifically missing these"), no
+  delayed ACKs, no ECN, simplified fast recovery (`cwnd` set directly to the new
+  `ssthresh`, no inflation during recovery). Fixed in this submission: go-back-N timeout
+  recovery (RFC 5681) and a separate RTO backoff multiplier that resets on forward
+  progress (RFC 6298) — see `fattree/sim/transport.py`'s module docstring.
+- **Packet level is `k ≤ 8` only.** A full discrete-event simulation at larger `k` is
+  not tractable in Python in reasonable time; Experiment 3 is deliberately scoped to
+  `k=4` for this reason (PHASE4.md's optional `k=8` pass was not run, for time).
+  Experiment 2 similarly needed two real performance fixes (`fattree/routing/ecmp.py`,
+  `fattree/sim/flow.py`) to make its `k=32` flow-level sweep tractable at all.
+- **`build_traditional_tree`'s oversubscription is fixed by its structure**, not a
+  tunable parameter matched to any specific industry hardware ratio.
+- **Classifier and scheduler routing schemes exist in the code** (`fattree/routing/`)
+  but are not part of this submission's 3 presented experiments — see below.
 
 ## Tests
 
@@ -200,269 +303,56 @@ Topology: fat-tree, k=8
 python -m pytest tests/ -v
 ```
 
-194 tests, all passing. Covers: topology counts vs. closed-form formulas for `k ∈
-{4,6,8}`; the paper's Fig. 3 addressing example; shortest-path hop counts;
-failure-count correctness and determinism under a fixed seed (including randomized
-`[min,max]` ranges); config validation; the traditional-tree baseline; the
-switches-with-failed-links metric against brute-force enumeration for small `k`; all 8
-traffic patterns' structural properties and flow-size class fractions; every routing
-scheme (valid/deterministic paths, failure behavior, two-level vs. the paper's Fig. 3
-example); and all three simulation levels, including graph-level metrics against
-brute-force BFS, flow-level max-min fairness against the classic asymmetric-bottleneck
-example, and packet-level exact delay/drop/reorder/retransmission properties.
+198 tests, all passing. Validation highlights relevant to this submission: exact
+packet-level delay/drop/reordering formulas and an M/D/1 queueing-theory check
+(`tests/test_packet_sim.py`); a sent = delivered + dropped conservation invariant under
+load; the Phase 4 TCP fix specifically — a 10-packet burst loss recovers with exactly 1
+timeout (not 10), RTO backoff returns to its base value once forward progress resumes,
+and an incast smoke test confirms a 1ms minimum RTO gives ≥5x the goodput of 200ms;
+`tests/test_e2_throughput.py`'s independent re-implementation of the collision-ceiling
+result (different path-enumeration code, different max-min solver, lands within 3 points
+of ~47% at k=8); and the underlying topology/failure/routing/flow-level machinery each
+experiment is built on (closed-form counts, the paper's own Fig. 3 addressing example,
+brute-force connectivity checks, max-min fairness against the classic
+asymmetric-bottleneck example).
 
-## Results
+## Other analyses available in the code
 
-### Switches with multiple failed links vs. switch port count
+Earlier development produced additional experiments whose code and tests still work,
+but which are not part of this submission's 3 presented results (figures/results not
+committed, to keep this README focused — rerun any of them with `python analysis.py
+<subcommand>`): `switches-multifail` (switches with ≥2 failed links vs. k, the
+assignment's own "intermediate" example metric), `critical-failure-pct` (smallest link
+failure % that drops connectivity below 99.9%/99%, superseded by Experiment 1's theory
+comparison), `link-vs-switch` (link vs. switch failures at equal %, superseded by
+Experiment 1 Part B), `table2` (reproduction of the paper's Table 2 across 10 traffic
+patterns × 4 scheme/topology combinations), `throughput-vs-failures` (5-scheme
+comparison including classifier/scheduler, superseded by Experiment 2), `incast` (the
+original 6-figure incast sweep, superseded by Experiment 3), and `mice-elephants`
+(FCT/slowdown of mice vs. elephants by routing scheme, including a packet-level
+`PrecomputedPathRouter` adapter for the batch-oriented classifier/scheduler schemes).
 
-Assignment's "intermediate" example metric (Sec. 5).
+## References
 
-**Setup.** For `k ∈ {4,8,16,24,32}`, fail each link independently at `p=1%`
-(bernoulli, all three link layers so every switch's `k` ports are equally exposed), 30
-seeded trials per `k`, mean ± 95% CI vs. the closed form
-`P(≥2 of k ports fail) = 1 - (1-p)^k - k·p·(1-p)^(k-1)`.
+1. M. Al-Fares, A. Loukissas, A. Vahdat, "A Scalable, Commodity Data Center Network
+   Architecture," SIGCOMM 2008. doi:[10.1145/1402946.1402967](https://doi.org/10.1145/1402946.1402967)
+2. M. Al-Fares, S. Radhakrishnan, B. Raghavan, N. Huang, A. Vahdat, "Hedera: Dynamic
+   Flow Scheduling for Data Center Networks," NSDI 2010.
+3. V. Vasudevan et al., "Safe and Effective Fine-grained TCP Retransmissions for
+   Datacenter Communication," SIGCOMM 2009.
+4. RFC 5681 (TCP Congestion Control), RFC 6298 (Computing TCP's Retransmission Timer),
+   RFC 4737 (Packet Reordering Metrics).
 
-`python analysis.py switches-multifail --ks 4 8 16 24 32 --p 1 --trials 30 --seed 1`
+## AI usage
 
-![Switches with ≥2 failed links vs. k: simulation mean ± 95% CI tracking the closed-form theory curve](figures/switches_multifail_vs_k.png)
-
-**Discussion.** The simulation tracks the closed-form curve closely at every `k`,
-within its 95% CI — validating the failure model's independence assumption. At `k=4` a
-switch sees ≥2 failures almost never (≈0.01 switches network-wide); by `k=32` the same
-per-link rate yields 50+ such switches on average (a `≈k²p²` effect: choose-2-of-`k`
-ports). A switch with ≥2 failed links is the precursor to a structural break — one
-failed uplink is absorbed by ECMP's `k/2−1` remaining parallel paths, but multiple
-simultaneous losses shrink that fan-out — directly motivating the
-[link-vs-switch](#link-failures-vs-switch-failures-at-equal) comparison below.
-
-### Throughput vs. link failure probability, by routing scheme
-
-Assignment's "advanced" example metric (Sec. 5) — throughput as a function of failure
-probability, chosen because it captures connectivity *and* capacity loss in one number.
-
-**Setup.** `k ∈ {8,16}`, link failure % ∈ `{0,5,...,30}` (bernoulli), 15 seeded trials,
-`random` traffic, flow level: build topology, fail it, build each of 5
-routers/configs on the *post-failure* graph, route, measure throughput as % of ideal.
-
-`python analysis.py throughput-vs-failures --ks 8 16 --pcts 0 5 10 15 20 25 30 --trials 15`
-
-![Throughput vs. link failure %, by routing scheme, for k=8 and k=16: ECMP degrades slowest, plain two-level fastest, failover and classifier in between](figures/throughput_vs_failures.png)
-
-**Discussion.** All five schemes decline roughly linearly with failure %, at very
-different rates. **ECMP degrades slowest** (k=8: 47.4%→37.6% over 0–30% failure) since
-it recomputes shortest paths live, automatically routing around failures. **Plain
-two-level degrades fastest** (k=8: 52.0%→22.0%) since its static tables drop a flow
-outright rather than try another live upward port. **`failover` recovers much of that
-gap** (k=8 at 30%: 22.0%→28.8%), direct evidence for the paper's own Sec. 3.8
-motivation. **Classifier stays highest throughout** (better load balancing even at
-0% failure); **scheduler tracks close to plain two-level**. Every curve is lower at
-`k=16` than `k=8` at the same failure % (more hosts, more hotspots), even though
-`k=16` is far more connectivity-resistant per the next experiment — throughput
-degrades gracefully long before connectivity collapses.
-
-### Critical link failure % vs. switch port count
-
-**Setup.** For `k ∈ {4,8,16,24,32}`, binary-search (1% resolution) the smallest link
-failure % (bernoulli) at which mean host-pair connectivity drops below 99.9%, and
-separately 99% (10 seeded trials per candidate, graph level).
-
-`python analysis.py critical-failure-pct --ks 4 8 16 24 32 --trials 10`
-
-![Critical link failure % vs. k: both the 99.9% and 99% connectivity thresholds rise steeply with k](figures/critical_failure_pct_vs_k.png)
-
-**Discussion.** The critical % rises sharply with `k`: ~3.5% at `k=4` to ~61%
-(99.9% threshold) / ~72% (99%) at `k=32`. This is the flip side of the previous
-experiment — multi-failure-switch exposure grows with `k`, but host-pair connectivity
-is far *more* robust at large `k`, since disconnecting a host pair needs wiping out
-*all* `(k/2)²` core paths, and `(k/2)²` grows quadratically while independent failures
-only erode that redundancy linearly in expectation. Adding ports doesn't just add
-hosts — it adds disproportionately more fault tolerance per unit failure probability.
-
-### Link failures vs. switch failures at equal %
-
-**Setup.** At `k=16`, `pct ∈ {0,1,2,5,10,15,20}`, compare pure link failures
-(edge-agg + agg-core) vs. pure switch failures (edge + agg) at the *same* %
-(bernoulli, 15 trials each, graph level): fraction connected, and inter-pod path
-diversity (pods 0/1, surviving shortest paths / `(k/2)²`).
-
-`python analysis.py link-vs-switch --k 16 --pcts 0 1 2 5 10 15 20 --trials 15`
-
-![Link vs switch failures at equal %: switch failures cause far steeper connectivity loss; path diversity degrades similarly for both, with link failures slightly worse at high %](figures/link_vs_switch_failures.png)
-
-**Discussion.** Switch failures are far more damaging to *connectivity*: at 20%
-switch failure, connectivity drops to ~63%, while 20% *link* failure leaves it
-essentially untouched (>99.9%) — each switch failure's "blast radius" removes `k` or
-`k/2` links at once (plus, for an edge switch, isolates its hosts outright). On *path
-diversity* the two curves are closer, with link failures slightly worse at high % (they
-spread evenly across every one of the `(k/2)²` paths, while switch failures are
-"lumpier"). The takeaway: link and switch failure rates are not interchangeable risk
-signals, and a monitoring policy tracking only link-level rate underestimates
-switch-failure risk.
-
-### Table 2 reproduction (paper Sec. 5, Table 2)
-
-**Setup.** `k=4`, link rate 96 Mb/s (paper's value), flow level, 10 traffic patterns ×
-4 "scheme"s (topology+routing combos: **tree** = `traditional-tree` + single-path;
-**two-level/classifier/scheduler** = fat-tree with that routing) × 15 trials,
-throughput as % of ideal.
-
-`python analysis.py table2 --k 4 --trials 15` (black ticks in the plot = paper's own values)
-
-![Table 2 reproduction: grouped bars (our simulation) vs. black ticks (paper's values), by pattern and scheme](figures/table2_reproduction.png)
-
-**Discussion.** The *shape* reproduces well: `tree` is clearly worst on adversarial
-patterns (`inter-pod-incoming`: 8.3% vs. paper's 28%), `scheduler` is the most
-consistently strong performer, exactly as the paper argues. Absolute numbers diverge
-on the worst-case patterns for three real reasons, not a bug: (1) our
-`traditional-tree` isn't calibrated to the paper's specific 3.6:1 hardware ratio; (2)
-our classifier/scheduler are simplified approximations, not literal
-re-implementations; (3) the paper measures over real packet-level Click emulation,
-this is a single max-min-fair flow-level snapshot. The patterns with no exotic hotspot
-structure (`random`, `stride1`/`staggered(1.0,0.0)`) land close to or exactly match the
-paper's values — the strongest evidence the underlying model is sound and the
-divergence elsewhere is a fidelity gap, not a correctness bug.
-
-### Experiment 9: Incast
-
-**In plain words.** M near-simultaneous responses (e.g. a fan-out query) converge on
-one requester. The fat-tree's full bisection bandwidth says nothing about the *last*
-hop — all M senders funnel into the same single link into the receiver's edge switch.
-That one port's queue overflows, TCP loses packets, and a 200ms RFC-6298-style minimum
-RTO (vs. a true RTT of tens of *microseconds* here) makes goodput collapse while the
-sender waits out a wildly oversized timeout.
-
-**Setup.** `k=4`, `tcp_lite`, barrier-synchronized rounds (round r+1 starts once round
-r's M responses all finish; each round uses fresh TCP/queue state). `block_bytes=64KB`,
-`rounds=10`, 5 trials, `M ∈ {1,2,4,8,15}`.
-
-`python analysis.py incast --k 4 --ms 1 2 4 8 15 --queue-sizes 32 64 128 --rounds 10 --trials 5`
-
-![Incast goodput collapse vs. M, one curve per receiver buffer size: the classic incast cliff, shifting right as the buffer grows](figures/incast_goodput_vs_m_buffer.png)
-
-**Discussion (buffer size).** Textbook incast collapse: a 32-packet buffer craters
-from 87.5% (M=1) to 0.5% at M=2; a 64-packet buffer survives to M=2 (93.3%) but
-collapses at M=4 (1.7%); 128 packets survives to M=4 (96.5%) before collapsing at M=8.
-Bigger buffers only move the cliff, they don't remove it.
-
-![Incast goodput vs. M, min RTO 200ms vs 1ms](figures/incast_goodput_vs_m_rto.png)
-
-**Discussion (min RTO).** At M=4, dropping min RTO from 200ms to 1ms raises mean
-goodput from 1.7% to 47.3% (high variance — recovery is timing-sensitive); at M=15,
-1ms goodput (9.7%) is ~50× the 200ms case. Direct reproduction of Vasudevan et al.'s
-(SIGCOMM 2009) claim: the 200ms floor is a WAN-TCP vestige mismatched to sub-ms
-datacenter RTT — most of the collapse is a timer problem, not a capacity problem.
-
-![Incast goodput vs. M: fat-tree vs. traditional tree](figures/incast_goodput_vs_m_topology.png)
-
-![Where incast packets are dropped, by layer: fat-tree vs. traditional tree, at M=15](figures/incast_drop_location.png)
-
-**Discussion (topology).** Fat-tree and traditional-tree collapse at essentially the
-same M — the richer core doesn't help, since the bottleneck was never the core. The
-drop-location split shows why differently: fat-tree drops 84% at the receiver's own
-last-hop port and 16% on an agg link; the traditional tree drops 100% at its single
-oversubscribed agg-to-core link, a second bottleneck on top of the universal last-hop one.
-
-![RTO timeouts per round vs. M, by buffer size](figures/incast_timeouts_vs_m.png)
-
-![Receiver edge-port queue length over one round, M=15](figures/incast_queue_series.png)
-
-**Discussion (timeouts/queue).** Timeouts climb steeply with M past each buffer's
-collapse point, tracking the goodput collapse directly — confirming timeouts, not just
-drops, are the proximate cause (a drop alone costs a retransmit; a timeout costs the
-full, possibly-doubled RTO). The queue trace for one M=15 round shows the mechanism:
-instant buffer fill, then sparse ~200ms-spaced blips as each lost flow's RTO-paced
-retry trickles in.
-
-`tcp_lite` lacks SACK, delayed ACKs, ECN, and full fast recovery — this makes the
-simulated collapse somewhat more severe than a production DCTCP/SACK stack, but the
-qualitative cliff/RTO/topology findings match real incast research.
-
-### Experiment 7: Mice vs. elephants
-
-**The question.** Datacenter traffic is bimodal: many small "mouse" flows and a few
-huge "elephant" flows carrying most of the bytes. The paper's classifier (§3.6) and
-scheduler (§3.7) both exist to keep elephants from starving mice. Do they?
-
-**Setup and an important simplification.** `k=4`, `tcp_lite` (`min_rto_ms=1`), Poisson
-flow arrivals per host (`generate_poisson_flows`) at `load ∈ {0.3,0.5,0.7}`, sizes from
-`mice-elephants` (mice 2–100KB, elephants 1–10MB, `elephant_fraction=0.1`), 3 trials per
-point. Flows are generated over a window longer than what's measured (a `tail_ms`
-buffer) so a flow landing late in the generation window still gets a fair chance to
-finish, avoiding a window-edge artifact that would otherwise look like congestion.
-
-The spec asks for classifier's rearrangement and scheduler's elephant-detection to run
-as *live hooks inside the packet engine*; this implementation instead uses
-`fattree/routing/precomputed.py`'s `PrecomputedPathRouter`, which decides each flow's
-path **once, at arrival, from the already-known batch** (`classifier.route_all()` for
-classifier; sequential reservation with *estimated* release for scheduler, since true
-release needs the simulation's own output — a circular dependency). single-path/ecmp/
-two-level are unaffected (already live, per-flow). This is the single most important
-caveat on everything below.
-
-`python analysis.py mice-elephants --k 4 --loads 0.3 0.5 0.7 --trials 3`
-
-![Mean slowdown by scheme, mice vs. elephants, load=0.5: scheduler has the lowest mouse slowdown but no completed elephants (N/A)](figures/mice_elephants_slowdown_bars.png)
-
-![Mouse p99 (tail) slowdown by scheme, load=0.5](figures/mice_elephants_mouse_p99_bars.png)
-
-![Mouse p99 slowdown vs. load, by scheme](figures/mice_elephants_mouse_p99_vs_load.png)
-
-![Elephant goodput vs. load, by scheme](figures/mice_elephants_elephant_goodput_vs_load.png)
-
-**Discussion (slowdown and tail latency).** At load=0.5, mean mouse slowdown ranges
-from 22.7× (single-path) to 5.8× (scheduler) — far from "near 1" since at `k=4` with
-10%-elephant Poisson traffic, this is sustained heavy congestion, not the light-load
-regime the low-load validation test checks. **Scheduler gives mice the lowest
-slowdown at every load** (2.1×/5.8×/8.2× at 0.3/0.5/0.7), consistent with its purpose.
-**Tail latency (p99) is where the spread is starkest**: single-path reaches 545–713×
-at loads 0.5–0.7 (mice stuck behind a long-lived elephant with nowhere else to go),
-while scheduler stays far lower (3.4×/7.9×/151×). Classifier's p99 is erratic (127× at
-load=0.5) despite a reasonable mean — the clearest symptom of the precomputed-batch
-simplification: its least-loaded-port decision is made once from a snapshot, not the
-actual continuously-changing queue state a live classifier would react to.
-
-**Discussion (elephants).** Elephant goodput at load=0.5 ranges from 283 Mb/s
-(single-path) to 604 Mb/s (classifier). **Scheduler's own elephants are the clear
-failure case: zero completed at any load** ("N/A" in the bar chart) — a structural
-issue, not a bug: at `k=4` there are only 4 inter-pod core paths and 2 intra-pod agg
-paths for dozens of elephants per trial, and a "reserved" path still shares its
-physical links with reservation-unaware two-level mouse traffic. A direct illustration
-of why the paper's design assumes reservation state scales with network size.
-
-![CDF of mouse FCT by scheme, load=0.7](figures/mice_elephants_mouse_fct_cdf.png)
-
-**Discussion (CDF).** At load=0.7, single-path's CDF lags past the 90th percentile and
-stretches past 400ms, while scheduler/classifier/two-level cluster tighter near the low
-end — the CDF makes visible what the p99 bars summarize as one number.
-
-![Share of flows vs. share of bytes by class: ~10% of flows (elephants) carry ~93% of bytes](figures/mice_elephants_bytes_pie.png)
-
-**Discussion (bytes).** With `elephant_fraction=0.1`, elephants are 10% of flows but
-93% of bytes — the textbook "few flows, most bytes" shape that motivates treating the
-two classes differently: per-flow fairness would starve elephants' bandwidth needs,
-per-byte fairness would let elephants dominate every mouse's queue.
-
-## Not done / future work
-
-9 experiments were planned across `PHASE2_PROMPT.md`/`PHASE3_*.md`; 6 are done (the 4
-Phase 2 experiments above, Incast, Mice vs. elephants). Remaining:
-
-- **collisions_vs_k** — throughput lost to two-level/ECMP hash collisions vs. `k`;
-  mechanically similar to `table2`/`throughput_vs_failures`, blocked on time only.
-- **scheduler_cost_vs_k** — time-per-placement and link/flow-state memory vs. `k`
-  (paper Table 3); `FlowSchedulerRouter.stats()` already records this, only the
-  sweep/plot script is missing.
-- **Experiment 8 (reordering: spraying vs. per-flow hashing)** — the packet engine
-  already supports spraying and `tests/test_packet_sim.py` already demonstrates the
-  reordering it causes; needs its own `analysis.py` subcommand.
-- **Live classifier/scheduler rearrangement inside the packet engine** — the single
-  biggest simplification in this submission (see Experiment 7 above); a second major
-  engine extension on the scale of the packet-engine rewrite.
-- **`web/`** GitHub Pages interactive site — not started.
-- `build_traditional_tree`'s oversubscription is fixed by its structure, not a tunable
-  parameter matching the paper's exact 3.6:1 hardware ratio.
-- `fattree/metrics.py`'s §6 list beyond `switches_with_multiple_failed_links` is not
-  separately implemented, though most of it exists via `fattree/sim/graph.py`.
-
-AI assistance (Claude, Anthropic) was used throughout development, from a specification
-written by the author; the author has reviewed and understands every line submitted.
+Developed with AI assistance (Claude, Anthropic) from specifications written by the
+author (`CLAUDE.md`, `PHASE2_PROMPT.md`, `PHASE3_*.md`, `PHASE4.md`), covering the
+simulation core, routing schemes, three simulation engines, analysis/visualization code,
+and the pytest suite. Two real performance bugs (ECMP's per-flow path recomputation,
+the max-min-fair solver's full-rescan loop) and two real correctness bugs in TCP-lite's
+timeout recovery (single-packet-only retransmission after a timeout, RTO backoff that
+could stay stuck after Karn's rule skipped an RTT sample) were found and fixed during
+this process, each traced to a specific observed symptom (slow k=32 sweeps; incast
+goodput far below what the fix predicted) rather than found by inspection alone. The
+author has reviewed and understands every line submitted and is responsible for its
+correctness.

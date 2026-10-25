@@ -57,9 +57,14 @@ class PortStats:
     def __init__(self):
         self.drops = 0
         self.queue_len_samples = []  # (time_ns, length) pairs, sampled on enqueue/dequeue
+        self.drop_times_ns = []      # time of each queue-overflow drop at this port
 
     def record_queue_len(self, time_ns, length):
         self.queue_len_samples.append((time_ns, length))
+
+    def record_drop(self, time_ns):
+        self.drops += 1
+        self.drop_times_ns.append(time_ns)
 
     def max_queue_len(self):
         return max((n for _, n in self.queue_len_samples), default=0)

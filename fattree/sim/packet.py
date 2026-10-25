@@ -231,7 +231,7 @@ class PacketSimulator:
         key = (u, v)
         q = self._queue(key)
         if len(q) >= self.queue_size:
-            self.port_stats[key].drops += 1
+            self.port_stats[key].record_drop(now_ns)
             # total_sent/delivered/dropped are a data-packet-only conservation
             # invariant (ACK drops are still counted per-port above, just not
             # folded into this data-only total).
