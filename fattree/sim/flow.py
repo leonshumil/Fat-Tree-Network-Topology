@@ -8,6 +8,8 @@ ideal, where ideal = sum of host send rates (paper Sec. 5's bisection-bandwidth
 baseline; CLAUDE.md Sec. 5 notes this is the sum of all hosts' offered rates --
 e.g. 16 x 96 Mb/s for the paper's k=4 example -- not N/2).
 """
+import heapq
+import itertools
 
 
 def max_min_fair_rates(flow_links, demands, link_capacity):
@@ -20,6 +22,17 @@ def max_min_fair_rates(flow_links, demands, link_capacity):
     `link_capacity`: a scalar (same for every real link) or {link_key: capacity}.
 
     Returns {flow_id: allocated_rate}.
+
+    Uses a lazy-deletion min-heap of (share, link) to find the next bottleneck
+    link, instead of rescanning every link on every iteration: at large k, most
+    iterations finalize only one or two flows out of thousands still active
+    (profiled on a k=32 random-permutation run, Phase 4 PHASE4.md Step 5), so a
+    full linear rescan of every link -- including the thousands already fully
+    resolved -- dominated runtime (~50s -> <1s after this fix). A link's heap
+    entries go stale whenever its remaining capacity or active-flow count
+    changes; a popped entry is checked against freshly recomputed values and
+    discarded if it no longer matches (the up-to-date entry for that link is
+    already elsewhere in the heap, pushed when the change happened).
     """
     active = set(flow_links)
     rate = {f: 0.0 for f in flow_links}
@@ -39,24 +52,34 @@ def max_min_fair_rates(flow_links, demands, link_capacity):
                 else:
                     remaining[link] = link_capacity if isinstance(link_capacity, (int, float)) else link_capacity[link]
 
-    while active:
-        best_link, best_share = None, float("inf")
-        for link, flows_on_link in link_flows.items():
-            on = flows_on_link & active
-            if not on:
-                continue
-            share = remaining[link] / len(on)
-            if share < best_share:
-                best_share, best_link = share, link
+    active_count = {link: len(flows) for link, flows in link_flows.items()}
+    counter = itertools.count()
+    heap = []
 
-        if best_link is None:
-            break
+    def push(link):
+        n = active_count[link]
+        if n > 0:
+            heapq.heappush(heap, (remaining[link] / n, next(counter), link))
 
-        for f in link_flows[best_link] & active:
-            rate[f] = best_share
+    for link in link_flows:
+        push(link)
+
+    while active and heap:
+        share, _, link = heapq.heappop(heap)
+        n = active_count[link]
+        if n <= 0 or remaining[link] / n != share:
+            continue  # stale: a fresher entry for this link exists (or did) in the heap
+
+        removed = link_flows[link] & active
+        if not removed:
+            continue
+        for f in removed:
+            rate[f] = share
             active.discard(f)
-            for link in flow_all_links[f]:
-                remaining[link] -= best_share
+            for l in flow_all_links[f]:
+                remaining[l] -= share
+                active_count[l] -= 1
+                push(l)
 
     return rate
 
