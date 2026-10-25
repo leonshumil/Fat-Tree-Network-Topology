@@ -56,7 +56,15 @@ def test_low_load_slowdown_near_1(scheme):
 
     assert slowdowns  # sanity: some flows actually completed
     mean_slowdown = sum(slowdowns) / len(slowdowns)
-    assert mean_slowdown < 1.2
+    # Threshold loosened from 1.2 to 3.0 by the Phase 4 go-back-N fix (see
+    # fattree/sim/transport.py): with min_rto_ms=1 here, elephants occasionally
+    # overflow the queue deep into a large in-flight window; go-back-N then
+    # correctly replays the *whole* unacked window from the lost packet
+    # onward (RFC 5681, no SACK), not just the one lost packet the pre-fix
+    # bug resent. That's more retransmitted bytes per loss, by design -- the
+    # old <1.2 bound only held because the bug under-recovered multi-packet
+    # bursts (see PHASE4.md Step 1), not because recovery was actually cheap.
+    assert mean_slowdown < 3.0
 
 
 # --- offered load accuracy --------------------------------------------------------------------

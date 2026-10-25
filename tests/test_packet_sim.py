@@ -265,6 +265,80 @@ def test_determinism_same_seed():
     assert r1["flow_stats"][0].reordered_packets == r2["flow_stats"][0].reordered_packets
 
 
+# --- 11. go-back-N: a whole burst of N losses costs one timeout, not N ---------------------------------------------------------------
+
+def test_timeout_recovers_whole_burst_with_one_timeout():
+    k = 8
+    g = build_fat_tree(k)
+    n_packets = 10
+    cfg = _cfg(k, "single-path", transport="tcp_lite", duration_ms=2000,
+               init_cwnd=n_packets, dupack_threshold=3, min_rto_ms=5, queue_size_packets=100)
+    router = get_router("single-path", g, cfg)
+    hosts = _hosts(g)
+    mtu = cfg["packet"]["mtu_bytes"]
+    flow = Flow(hosts[0], hosts[-1], mtu * n_packets, 0.0, "mouse")  # exactly n_packets packets
+
+    sim = PacketSimulator(g, router, [flow], cfg)
+    orig_enqueue = sim._enqueue
+
+    def intercept(now_ns, u, v, pkt):
+        if not pkt.is_ack and not pkt.is_retx and pkt.hop == 0:
+            return  # drop every original transmission once -- the whole initial burst is lost
+        return orig_enqueue(now_ns, u, v, pkt)
+
+    sim._enqueue = intercept
+    result = sim.run()
+
+    fs = result["flow_stats"][0]
+    assert fs.fct_ns() is not None  # flow still completed
+    assert fs.timeout_count == 1    # one timeout recovers the whole burst, not n_packets
+    assert fs.retransmit_count >= n_packets
+
+
+# --- 12. backoff resets to 1x (base RTO) once the flow makes forward progress again ---------------------------------------------------------------
+
+def test_backoff_resets_after_timeout_recovery():
+    from fattree.sim.transport import TcpLiteSender
+
+    sender = TcpLiteSender(n_packets=5, min_rto_ns=1_000_000, init_cwnd=5)
+    for seq in range(5):
+        sender.on_send(seq, now_ns=0)
+
+    gen = sender.timer_generation
+    sender.on_timeout(gen, now_ns=1_000_000)
+    assert sender.backoff == 2
+    assert sender.rto_ns == 2 * sender.base_rto_ns
+
+    seq = sender.next_send_seq()  # go-back-N: resends seq 0 (send_base)
+    assert seq == 0
+    sender.on_send(seq, now_ns=2_000_000)
+    sender.on_ack(ack_no=1, now_ns=2_100_000)  # forward progress
+
+    assert sender.backoff == 1
+    assert sender.rto_ns == sender.base_rto_ns
+
+
+# --- 13. incast smoke test: a small min RTO recovers far more goodput than the 200ms default ---------------------------------------------------------------
+
+def test_incast_small_min_rto_at_least_5x_goodput():
+    from analysis import _run_incast_rounds
+
+    k = 4
+    g = build_fat_tree(k)
+
+    cfg_slow = _cfg(k, "two-level", transport="tcp_lite", queue_size_packets=64,
+                     min_rto_ms=200, duration_ms=3000)
+    router_slow = get_router("two-level", g, cfg_slow)
+    stats_slow = _run_incast_rounds(g, router_slow, cfg_slow, m=8, rounds=10, seed=1)
+
+    cfg_fast = _cfg(k, "two-level", transport="tcp_lite", queue_size_packets=64,
+                     min_rto_ms=1, duration_ms=3000)
+    router_fast = get_router("two-level", g, cfg_fast)
+    stats_fast = _run_incast_rounds(g, router_fast, cfg_fast, m=8, rounds=10, seed=1)
+
+    assert stats_fast["goodput_bps"] >= 5 * stats_slow["goodput_bps"]
+
+
 # --- 10. performance smoke test ---------------------------------------------------------------
 
 def test_performance_smoke_k4_10ms():

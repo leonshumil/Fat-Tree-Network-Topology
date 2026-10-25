@@ -13,10 +13,22 @@ tcp_lite: a simplified Reno-like reliable transport --
     fast retransmit + cwnd/ssthresh halved (simplified fast recovery: cwnd is
     set to the new ssthresh, not inflated further during recovery).
     `dupack_threshold=None` disables fast retransmit entirely.
-  - RTO per RFC 6298 (Jacobson/Karels): SRTT/RTTVAR-based, exponential backoff
-    on timeout, cwnd reset to 1 packet. RTT is sampled only from segments that
-    were never retransmitted (Karn's algorithm) -- a stale timeout event (from
-    a since-superseded RTO generation) is detected via `timer_generation` and
+  - Timeout recovery is go-back-N (RFC 5681 "slow start after loss"): a
+    timeout rewinds `next_seq` to `send_base`, not just one packet, so a
+    burst of N consecutive losses costs one timeout, not N -- the gap then
+    refills through the normal ACK-driven send path as cwnd reopens from 1.
+    A resend of a packet the receiver already has (because only the ACK, or
+    a different packet in the burst, was actually lost) is expected and
+    surfaces as a spurious retransmission on the receiver side.
+  - RTO per RFC 6298 (Jacobson/Karels): a "base" RTO from SRTT/RTTVAR, times a
+    separate backoff multiplier that doubles on each timeout and resets to 1x
+    on any ACK that advances `send_base` (forward progress) -- not only on a
+    fresh RTT sample, since Karn's algorithm (no RTT sample from a
+    retransmitted segment) would otherwise leave a connection that suffered
+    one bad RTO permanently backed off even after it starts making progress
+    again, with no sample ever available to bring the estimate back down.
+    cwnd resets to 1 packet on timeout. A stale timeout event (from a
+    since-superseded RTO generation) is detected via `timer_generation` and
     ignored by the caller.
 
 NOT implemented (documented limitation, see README): SACK, delayed ACKs, ECN,
@@ -62,7 +74,9 @@ class TcpLiteSender:
         self.dupack_threshold = dupack_threshold
         self.srtt = None
         self.rttvar = None
-        self.rto_ns = min_rto_ns
+        self.base_rto_ns = min_rto_ns  # RFC 6298 srtt/rttvar estimate, before the backoff multiplier
+        self.backoff = 1               # doubles on timeout, resets to 1 on forward progress
+        self.rto_ns = min_rto_ns       # effective RTO actually used to arm timers: min(max, base*backoff)
         self.timer_generation = 0
         self.send_time = {}         # seq -> most recent send_time_ns
         self.retransmitted = set()  # seqs ever retransmitted (Karn's algorithm)
@@ -76,20 +90,31 @@ class TcpLiteSender:
         return self.send_base < self.next_seq
 
     def next_send_seq(self):
-        """Return the next new seq to send if the window allows it, else None."""
+        """Return the next seq to send if the window allows it, else None. After
+        a timeout rewinds next_seq to send_base (go-back-N), this naturally
+        resends the whole unacked window as cwnd reopens, not just one packet."""
         if self.next_seq < self.n_packets and (self.next_seq - self.send_base) < int(self.cwnd):
             seq = self.next_seq
             self.next_seq += 1
             return seq
         return None
 
-    def on_send(self, seq, now_ns, is_retx):
+    def on_send(self, seq, now_ns):
+        """Record a send of `seq`; returns True if `seq` was already sent
+        before (a retransmission, whether via fast retransmit or a
+        go-back-N refill) -- a single source of truth instead of trusting
+        the caller to say so."""
+        is_retx = seq in self.send_time
         self.send_time[seq] = now_ns
         if is_retx:
             self.retransmitted.add(seq)
             self.retransmit_count += 1
+        return is_retx
 
-    def _update_rto(self, rtt_sample_ns):
+    def _recompute_rto(self):
+        self.rto_ns = min(self.max_rto_ns, int(self.base_rto_ns * self.backoff))
+
+    def _update_base_rto(self, rtt_sample_ns):
         if self.srtt is None:
             self.srtt = float(rtt_sample_ns)
             self.rttvar = rtt_sample_ns / 2.0
@@ -97,7 +122,7 @@ class TcpLiteSender:
             alpha, beta = 1 / 8, 1 / 4
             self.rttvar = (1 - beta) * self.rttvar + beta * abs(self.srtt - rtt_sample_ns)
             self.srtt = (1 - alpha) * self.srtt + alpha * rtt_sample_ns
-        self.rto_ns = min(self.max_rto_ns, max(self.min_rto_ns, int(self.srtt + 4 * self.rttvar)))
+        self.base_rto_ns = max(self.min_rto_ns, int(self.srtt + 4 * self.rttvar))
 
     def on_ack(self, ack_no, now_ns):
         """Returns 'new' | 'dup' | 'fast_retransmit' | 'stale'."""
@@ -117,10 +142,12 @@ class TcpLiteSender:
                 self.cwnd += newly_acked / self.cwnd
             last_acked_seq = ack_no - 1
             if last_acked_seq in self.send_time and last_acked_seq not in self.retransmitted:
-                self._update_rto(now_ns - self.send_time[last_acked_seq])
+                self._update_base_rto(now_ns - self.send_time[last_acked_seq])
             self.send_base = ack_no
             self.dup_ack_count = 0
             self.timer_generation += 1  # invalidate any in-flight timer for the old window
+            self.backoff = 1            # forward progress: clear any timeout backoff
+            self._recompute_rto()
             if self.send_base >= self.n_packets:
                 self.done = True
                 self.finish_time_ns = now_ns
@@ -133,7 +160,9 @@ class TcpLiteSender:
             return False
         self.ssthresh = max(self.cwnd / 2, 2.0)
         self.cwnd = 1.0
-        self.rto_ns = min(self.max_rto_ns, self.rto_ns * 2)
+        self.next_seq = self.send_base  # go-back-N: resend the whole unacked window, not just send_base
+        self.backoff *= 2
+        self._recompute_rto()
         self.timeout_count += 1
         self.timer_generation += 1
         return True

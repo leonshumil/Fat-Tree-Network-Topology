@@ -187,16 +187,17 @@ class PacketSimulator:
     def _size_for_seq(self, flow, seq, n_packets):
         return min(self.mtu_bytes, flow.size_bytes - seq * self.mtu_bytes)
 
-    def _send_data_packet(self, idx, seq, now_ns, is_retx=False):
+    def _send_data_packet(self, idx, seq, now_ns):
         flow = self.flows[idx]
         size = self._size_for_seq(flow, seq, self.flow_n_packets[idx])
         path = self._packet_path(self.flow_paths[idx])
-        pkt = _Packet(idx, seq, size, is_ack=False, ack_no=None, send_time_ns=now_ns, path=path, is_retx=is_retx)
-        self.total_sent += 1
+        is_retx = False
         if idx in self.senders:
-            self.senders[idx].on_send(seq, now_ns, is_retx)
+            is_retx = self.senders[idx].on_send(seq, now_ns)
             if is_retx:
                 self.flow_stats[idx].retransmit_count += 1
+        pkt = _Packet(idx, seq, size, is_ack=False, ack_no=None, send_time_ns=now_ns, path=path, is_retx=is_retx)
+        self.total_sent += 1
         self._enqueue_departure(pkt, now_ns)
 
     def _handle_send(self, now_ns, payload):
@@ -315,17 +316,24 @@ class PacketSimulator:
             self._arm_timer(idx, now_ns)
         elif result == "fast_retransmit":
             fs.fast_retransmit_count += 1
-            self._send_data_packet(idx, sender.send_base, now_ns, is_retx=True)
+            self._send_data_packet(idx, sender.send_base, now_ns)
             self._arm_timer(idx, now_ns)
 
     def _handle_timeout(self, now_ns, payload):
+        """Go-back-N recovery (RFC 5681): on_timeout() rewinds the sender's
+        next_seq to send_base, so draining next_send_seq() here resends the
+        whole unacked window as cwnd reopens -- one timeout recovers a whole
+        burst of losses, not one timeout per lost packet."""
         idx, generation = payload
         sender = self.senders[idx]
         fs = self.flow_stats[idx]
         if not sender.on_timeout(generation, now_ns):
             return  # stale
         fs.timeout_count += 1
-        self._send_data_packet(idx, sender.send_base, now_ns, is_retx=True)
+        seq = sender.next_send_seq()
+        while seq is not None:
+            self._send_data_packet(idx, seq, now_ns)
+            seq = sender.next_send_seq()
         self._arm_timer(idx, now_ns)
 
     # --- results --------------------------------------------------------------------
