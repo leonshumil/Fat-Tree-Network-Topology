@@ -1,0 +1,25 @@
+# Experiment 1 (simple): Resilience -- what breaks, and how much it matters.
+# Graph level (fattree/sim/graph.py): no traffic/routing needed, just connectivity
+# and path-diversity under failures. PHASE4.md Step 4.
+#
+# Part A: topology.k swept over {8, 16, 32}; failures.link_pct swept over
+#         {0, 5, ..., 60}, bernoulli, fabric links only (link_layers below).
+# Part B: topology.k=16 fixed; failures.switch_pct in {5, 10}, one switch
+#         layer at a time (edge-only / agg-only / core-only).
+# analysis.py's e1-resilience subcommand sweeps both via --ks/--pcts and
+# --switch-pcts/--switch-layer-one-at-a-time CLI flags; the values below are
+# this experiment's defaults/documentation, matching run.py's convention of
+# CLI flags overriding a config file.
+topology:
+  k: 16
+failures:
+  link_pct: 0
+  switch_pct: 0
+  link_layers: [edge-agg, agg-core]  # fabric links only, per PHASE4.md Step 4
+  switch_layers: [edge, agg, core]
+  mode: bernoulli
+trials: 30
+seed: 1
+sweep:
+  param: topology.k
+  values: [8, 16, 32]

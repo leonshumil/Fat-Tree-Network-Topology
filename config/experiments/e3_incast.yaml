@@ -1,0 +1,22 @@
+# Experiment 3 (smart): Incast -- why throughput collapses, what controls the
+# collapse point, and whether the fat-tree's bisection bandwidth helps.
+# Packet level (fattree/sim/packet.py), tcp_lite transport (fixed in Phase 4
+# Step 1: go-back-N timeout recovery + separate RTO backoff). PHASE4.md Step 6.
+#
+# k=4 always run; k=8 run too if runtime allows (analysis.py's e3-incast
+# --ks flag). M (senders) swept per k; buffer size and min_rto_ms swept
+# per figure; fat-tree vs traditional-tree compared at one buffer/RTO point.
+topology:
+  k: 4
+routing: two-level
+packet:
+  transport: tcp_lite
+  queue_size_packets: 64
+  min_rto_ms: 200
+  duration_ms: 3000
+incast:
+  block_bytes: 65_536
+  rounds: 20
+  sender_placement: other-pods
+trials: 10
+seed: 1

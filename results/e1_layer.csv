@@ -1,0 +1,7 @@
+layer,switch_pct,pct_disconnected_mean,pct_disconnected_ci95
+edge,5,10.792043418051488,1.496876043500767
+edge,10,20.198278144346695,1.7274070421155658
+agg,5,0.0,0.0
+agg,10,0.0,0.0
+core,5,0.0,0.0
+core,10,0.0,0.0

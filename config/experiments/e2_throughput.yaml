@@ -1,0 +1,25 @@
+# Experiment 2 (simple): Speed under failures, and the hash-collision ceiling.
+# Flow level (fattree/sim/flow.py, max-min fair): every host sends at line
+# rate, fixed flow size, random permutation traffic. PHASE4.md Step 5.
+#
+# Part A: topology.k=16 fixed; failures.link_pct swept over {0, 5, ..., 30},
+#         bernoulli; schemes two-level / two-level+failover / ECMP.
+# Part B: failures.link_pct=0 fixed; topology.k swept over {4, 8, 16, 24, 32}.
+# analysis.py's e2-throughput subcommand sweeps both via --ks/--pcts.
+topology:
+  k: 16
+traffic:
+  pattern: random
+  load: 1.0
+  size_model: fixed
+  fixed_size_bytes: 1_000_000
+routing: two-level
+failures:
+  link_pct: 0
+  switch_pct: 0
+  link_layers: [edge-agg, agg-core]
+  mode: bernoulli
+simulation:
+  level: flow
+trials: 20
+seed: 1

@@ -21,6 +21,22 @@ from fattree.topology import build_topology, validate_topology
 LAYER_COLORS = {"core": "#2a6f97", "agg": "#52b69a", "edge": "#f4a259", "host": "#8d99ae"}
 LAYER_Y = {"host": 0, "edge": 1, "agg": 2, "core": 3}
 
+plt.rcParams["font.size"] = 11  # Phase 4 graph rule: readable, >= 11pt
+
+# Consistent colors across every Phase 4 (E1/E2/E3) figure: one color per k,
+# and one per routing scheme/buffer size/topology (PHASE4.md Step 3 rule 5).
+K_COLORS = {4: "#8d99ae", 8: "#2a6f97", 16: "#52b69a", 24: "#f4a259", 32: "#d00000", 48: "#7b2cbf", 64: "#1b4332"}
+SCHEME_COLORS = {
+    "single-path": "#8d99ae", "ecmp": "#f4a259", "two-level": "#2a6f97",
+    "two-level-failover": "#52b69a", "classifier": "#52b69a", "scheduler": "#d00000",
+}
+TOPOLOGY_COLORS = {"fat-tree": "#2a6f97", "traditional-tree": "#d00000"}
+
+
+def _no_top_right_spines(ax):
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
 
 def layout(g, k):
     """Layer nodes by type (core top, host bottom), grouped by pod left to right."""
@@ -410,12 +426,6 @@ def plot_incast_queue_series(samples, m, out_path):
     return out_path
 
 
-SCHEME_COLORS = {
-    "single-path": "#8d99ae", "ecmp": "#f4a259", "two-level": "#2a6f97",
-    "classifier": "#52b69a", "scheduler": "#d00000",
-}
-
-
 def plot_mice_elephants_bars(bar_data, out_path, ylabel="slowdown (FCT / ideal FCT)",
                               title="Mean slowdown by scheme, mice vs. elephants (load=0.5)", single=False):
     """Grouped bar chart: mean slowdown per scheme, mice vs. elephants (or a
@@ -508,6 +518,103 @@ def plot_mice_elephants_bytes_pie(flow_share, byte_share, out_path):
         ax.pie(values, labels=labels, colors=[colors[l] for l in labels], autopct="%1.0f%%", startangle=90)
         ax.set_title(title)
     fig.suptitle("Mice vs. elephants: few flows, most bytes")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# --- Phase 4, E1: Resilience (PHASE4.md Steps 3-4) --------------------------------------------------------------------
+
+def plot_e1_connectivity(rows, ks, out_path):
+    """Fraction of server pairs connected vs. link failure %, one line per k,
+    with the theory curve 1 - 2*p^(k/2) dashed. Annotates where each k's
+    curve drops below 99.9%."""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for k in ks:
+        k_rows = sorted((r for r in rows if r["k"] == k), key=lambda r: r["link_pct"])
+        pcts = [r["link_pct"] for r in k_rows]
+        means = [100 * r["fraction_connected_mean"] for r in k_rows]
+        cis = [100 * r["fraction_connected_ci95"] for r in k_rows]
+        theory = [100 * r["theory_connected"] for r in k_rows]
+        color = K_COLORS.get(k, "#333333")
+        ax.errorbar(pcts, means, yerr=cis, fmt="o-", capsize=2, color=color, label=f"k={k} (sim)")
+        ax.plot(pcts, theory, "--", color=color, alpha=0.6, label=f"k={k} theory: 1-2p^(k/2)")
+
+        below = next((r["link_pct"] for r in k_rows if r["fraction_connected_mean"] < 0.999), None)
+        if below is not None:
+            ax.annotate(f"k={k}: <99.9% at {below:.0f}%", xy=(below, 99.9), xytext=(below + 3, 99.9 - 12),
+                        fontsize=9, color=color, arrowprops=dict(arrowstyle="->", color=color, lw=1))
+    ax.axhline(99.9, color="gray", linestyle=":", linewidth=0.8)
+    ax.set_xlabel("link failure % (bernoulli, fabric links)")
+    ax.set_ylabel("server pairs connected (%)")
+    ax.set_ylim(0, 102)
+    ax.set_title("Bigger fat-trees survive far more broken links")
+    ax.legend(frameon=False, fontsize=9, ncol=2)
+    _no_top_right_spines(ax)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_e1_path_diversity(rows, ks, out_path):
+    """Surviving inter-pod shortest paths / (k/2)^2 vs. link failure %, one
+    line per k, with a single theory curve (1-p)^4, k-independent since it's
+    the survival probability of one specific 4-fabric-link path."""
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    all_pcts = sorted({r["link_pct"] for r in rows})
+    theory = [100 * (1 - p / 100) ** 4 for p in all_pcts]
+    ax.plot(all_pcts, theory, "--", color="black", alpha=0.6, label="theory: (1-p)^4")
+    for k in ks:
+        k_rows = sorted((r for r in rows if r["k"] == k), key=lambda r: r["link_pct"])
+        pcts = [r["link_pct"] for r in k_rows]
+        means = [100 * r["path_diversity_mean"] for r in k_rows]
+        cis = [100 * r["path_diversity_ci95"] for r in k_rows]
+        ax.errorbar(pcts, means, yerr=cis, fmt="o-", capsize=2, color=K_COLORS.get(k, "#333"), label=f"k={k}")
+
+    half_point = next((p for p in all_pcts if (1 - p / 100) ** 4 < 0.5), None)
+    if half_point is not None:
+        ax.annotate("half the paths are already gone here", xy=(half_point, 50),
+                    xytext=(half_point + 5, 65), fontsize=9,
+                    arrowprops=dict(arrowstyle="->", color="black", lw=1))
+    ax.set_xlabel("link failure % (bernoulli, fabric links)")
+    ax.set_ylabel("surviving inter-pod paths / (k/2)² (%)")
+    ax.set_ylim(0, 102)
+    ax.set_title("Redundancy erodes long before connectivity is lost")
+    ax.legend(frameon=False, fontsize=9)
+    _no_top_right_spines(ax)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def plot_e1_layer(rows, out_path):
+    """Grouped bars: % of server pairs disconnected when 5%/10% of switches
+    in ONE layer fail, by layer (edge/agg/core)."""
+    layers = ["edge", "agg", "core"]
+    pcts = sorted({r["switch_pct"] for r in rows})
+    colors = {pcts[0]: "#2a6f97", pcts[-1]: "#d00000"} if len(pcts) > 1 else {pcts[0]: "#2a6f97"}
+
+    by_layer = {layer: {r["switch_pct"]: r for r in rows if r["layer"] == layer} for layer in layers}
+    x = range(len(layers))
+    width = 0.8 / max(1, len(pcts))
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for i, pct in enumerate(pcts):
+        means = [by_layer[layer][pct]["pct_disconnected_mean"] for layer in layers]
+        cis = [by_layer[layer][pct]["pct_disconnected_ci95"] for layer in layers]
+        offsets = [xi + (i - (len(pcts) - 1) / 2) * width for xi in x]
+        ax.bar(offsets, means, width, yerr=cis, capsize=3, color=colors.get(pct, "#333"), label=f"{pct}% of switches")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(layers)
+    ax.set_ylabel("server pairs disconnected (%)")
+    ax.set_title("An edge failure cuts off its own servers; core/agg barely touch connectivity")
+    ax.legend(frameon=False, fontsize=9)
+    _no_top_right_spines(ax)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fig.savefig(out_path, dpi=150)

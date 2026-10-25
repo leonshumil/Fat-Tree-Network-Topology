@@ -28,6 +28,9 @@ from fattree.topology import build_fat_tree, build_traditional_tree, hosts_of
 from fattree.traffic import Flow, generate_pairs, generate_poisson_flows, generate_traffic
 from visualize import (
     plot_critical_failure_pct,
+    plot_e1_connectivity,
+    plot_e1_layer,
+    plot_e1_path_diversity,
     plot_incast_drop_location,
     plot_incast_goodput_vs_m,
     plot_incast_queue_series,
@@ -252,6 +255,66 @@ def cmd_throughput_vs_failures(args):
 
     _write_csv(args.csv, rows)
     print(f"wrote {plot_throughput_vs_failures(rows, args.ks, schemes, args.plot)}")
+
+
+# --- e1-resilience (Phase 4, PHASE4.md Step 4) --------------------------------------------------------------------
+
+def cmd_e1_resilience(args):
+    """What breaks when random parts of the network fail, and does it matter
+    which layer fails. Part A: connectivity + inter-pod path diversity vs.
+    link failure %, one curve per k, with theory overlays. Part B: % of
+    server pairs disconnected when one switch layer at a time fails, k fixed.
+    """
+    rows_conn = []
+    for k in args.ks:
+        g = build_fat_tree(k)
+        for pct in args.pcts:
+            fc_vals, pd_vals = [], []
+            for t in range(args.trials):
+                failures_cfg = {
+                    "link_pct": pct, "switch_pct": 0,
+                    "link_layers": ["edge-agg", "agg-core"], "switch_layers": [], "mode": "bernoulli",
+                }
+                g2, _ = apply_failures(g, failures_cfg, seed=args.seed + t)
+                fc_vals.append(connectivity_and_path_metrics(g, g2)["fraction_connected"])
+                pd_vals.append(path_diversity(g2, k, 0, 1))
+            fc_mean, fc_ci = _mean_ci95(fc_vals)
+            pd_mean, pd_ci = _mean_ci95(pd_vals)
+            p = pct / 100
+            rows_conn.append({
+                "k": k, "link_pct": pct,
+                "fraction_connected_mean": fc_mean, "fraction_connected_ci95": fc_ci,
+                "theory_connected": 1 - 2 * p ** (k // 2),
+                "path_diversity_mean": pd_mean, "path_diversity_ci95": pd_ci,
+                "theory_diversity": (1 - p) ** 4,
+            })
+            print(f"k={k:>2} link_pct={pct:>4}%  connected={fc_mean:.4f} (theory {1 - 2 * p ** (k // 2):.4f})  "
+                  f"diversity={pd_mean:.3f} (theory {(1 - p) ** 4:.3f})")
+
+    rows_layer = []
+    g_layer = build_fat_tree(args.layer_k)
+    for layer in ("edge", "agg", "core"):
+        for pct in args.switch_pcts:
+            vals = []
+            for t in range(args.trials):
+                failures_cfg = {
+                    "link_pct": 0, "switch_pct": pct,
+                    "link_layers": [], "switch_layers": [layer], "mode": "bernoulli",
+                }
+                g2, _ = apply_failures(g_layer, failures_cfg, seed=args.seed + t)
+                vals.append(connectivity_and_path_metrics(g_layer, g2)["fraction_connected"])
+            mean, ci = _mean_ci95(vals)
+            rows_layer.append({
+                "layer": layer, "switch_pct": pct,
+                "pct_disconnected_mean": 100 * (1 - mean), "pct_disconnected_ci95": 100 * ci,
+            })
+            print(f"layer={layer:<5} switch_pct={pct}%  disconnected={100 * (1 - mean):.2f}% (+/-{100 * ci:.2f})")
+
+    _write_csv(args.csv, rows_conn)
+    _write_csv(args.csv_layer, rows_layer)
+    print(f"wrote {plot_e1_connectivity(rows_conn, args.ks, args.plot_connectivity)}")
+    print(f"wrote {plot_e1_path_diversity(rows_conn, args.ks, args.plot_diversity)}")
+    print(f"wrote {plot_e1_layer(rows_layer, args.plot_layer)}")
 
 
 # --- link-vs-switch-failures --------------------------------------------------------------------
@@ -697,6 +760,20 @@ def main():
     p4.add_argument("--csv", default="results/throughput_vs_failures.csv")
     p4.add_argument("--plot", default="figures/throughput_vs_failures.png")
     p4.set_defaults(func=cmd_throughput_vs_failures)
+
+    pe1 = sub.add_parser("e1-resilience", help="E1: resilience -- what breaks, and how much it matters (Phase 4)")
+    pe1.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32])
+    pe1.add_argument("--pcts", type=float, nargs="+", default=[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60])
+    pe1.add_argument("--trials", type=int, default=30)
+    pe1.add_argument("--seed", type=int, default=1)
+    pe1.add_argument("--layer-k", type=int, default=16)
+    pe1.add_argument("--switch-pcts", type=float, nargs="+", default=[5, 10])
+    pe1.add_argument("--csv", default="results/e1_connectivity.csv")
+    pe1.add_argument("--csv-layer", default="results/e1_layer.csv")
+    pe1.add_argument("--plot-connectivity", default="figures/e1_connectivity.png")
+    pe1.add_argument("--plot-diversity", default="figures/e1_path_diversity.png")
+    pe1.add_argument("--plot-layer", default="figures/e1_layer.png")
+    pe1.set_defaults(func=cmd_e1_resilience)
 
     p5 = sub.add_parser("link-vs-switch", help="link failures vs switch failures at equal %%: connectivity + path diversity")
     p5.add_argument("--k", type=int, default=16)
