@@ -575,10 +575,10 @@ def plot_e1_path_diversity(rows, ks, out_path):
         cis = [100 * r["path_diversity_ci95"] for r in k_rows]
         ax.errorbar(pcts, means, yerr=cis, fmt="o-", capsize=2, color=K_COLORS.get(k, "#333"), label=f"k={k}")
 
-    half_point = next((p for p in all_pcts if (1 - p / 100) ** 4 < 0.5), None)
-    if half_point is not None:
+    half_point = 100 * (1 - 0.5 ** (1 / 4))  # exact (1-p)^4 = 0.5 crossing, ~15.9%, not the nearest data point
+    if all_pcts and all_pcts[0] <= half_point <= all_pcts[-1]:
         ax.annotate("half the paths are already gone here", xy=(half_point, 50),
-                    xytext=(half_point + 5, 65), fontsize=9,
+                    xytext=(half_point + 8, 65), fontsize=9,
                     arrowprops=dict(arrowstyle="->", color="black", lw=1))
     ax.set_xlabel("link failure % (bernoulli, fabric links)")
     ax.set_ylabel("surviving inter-pod paths / (k/2)² (%)")
@@ -608,7 +608,11 @@ def plot_e1_layer(rows, out_path):
         means = [by_layer[layer][pct]["pct_disconnected_mean"] for layer in layers]
         cis = [by_layer[layer][pct]["pct_disconnected_ci95"] for layer in layers]
         offsets = [xi + (i - (len(pcts) - 1) / 2) * width for xi in x]
-        ax.bar(offsets, means, width, yerr=cis, capsize=3, color=colors.get(pct, "#333"), label=f"{pct}% of switches")
+        bars = ax.bar(offsets, means, width, yerr=cis, capsize=3, color=colors.get(pct, "#333"),
+                      label=f"{pct}% of switches")
+        for bar, mean in zip(bars, means):
+            if mean == 0:  # a zero bar is invisible -- label it so it reads as "measured zero", not "missing"
+                ax.text(bar.get_x() + bar.get_width() / 2, 0.3, "0%", ha="center", va="bottom", fontsize=8)
     ax.set_xticks(list(x))
     ax.set_xticklabels(layers)
     ax.set_ylabel("server pairs disconnected (%)")
@@ -659,12 +663,17 @@ def plot_e2_vs_failures(rows, schemes, out_path):
 
 def plot_e2_collision_ceiling(rows, schemes, out_path):
     """Throughput (% of ideal) at 0% failures vs. k, one line per scheme, a
-    100% reference line, and the analytic per-hop random-hashing estimate
-    1 - (1-2/k)^(k/2) dashed."""
+    100% reference line, and the analytic single-hop upper bound
+    1 - (1-2/k)^(k/2) dashed. `two-level-failover` is dropped from this
+    plot (not the CSV) -- at 0% failures it is numerically identical to
+    `two-level` (failover only changes behavior once something is broken),
+    so its line exactly overplots and hides the `two-level` line
+    (PHASE5.md Step 2)."""
+    schemes = [s for s in schemes if s != "two-level-failover"]
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ks = sorted({r["k"] for r in rows})
     theory = [next(r["theory_pct"] for r in rows if r["k"] == k) for k in ks]
-    ax.plot(ks, theory, "--", color="black", alpha=0.7, label="theory: 1-(1-2/k)^(k/2)")
+    ax.plot(ks, theory, "--", color="black", alpha=0.7, label="single-hop upper bound: 1-(1-2/k)^(k/2)")
     ax.axhline(100, color="gray", linestyle=":", linewidth=1)
     for scheme in schemes:
         s_rows = sorted((r for r in rows if r["scheme"] == scheme), key=lambda r: r["k"])
@@ -735,14 +744,24 @@ def plot_e3_where_time_goes(rows, ms, out_path):
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
     x = range(len(ms))
+    all_totals = [r["sending_ms"] + r["waiting_ms"] for r in rows]
+    y_max = max(all_totals) if all_totals else 1.0
+    min_label_y = 0.02 * y_max  # M=1/M=2 bars are under 1ms, invisible on a ~250ms axis without a label floor
+
     for i, rto in enumerate(rtos):
         rto_rows = {r["m"]: r for r in rows if r["min_rto_ms"] == rto}
         sending = [rto_rows[m]["sending_ms"] for m in ms]
         waiting = [rto_rows[m]["waiting_ms"] for m in ms]
         offsets = [xi + (i - 0.5) * width for xi in x]
-        ax.bar(offsets, sending, width, color=send_color, label="sending data" if i == 0 else None)
+        bars = ax.bar(offsets, sending, width, color=send_color, label="sending data" if i == 0 else None)
         ax.bar(offsets, waiting, width, bottom=sending, color=rto_colors[rto],
                label=f"waiting (min RTO {rto}ms)")
+        for bar, s, w in zip(bars, sending, waiting):
+            total = s + w
+            goodput_pct = 100 * s / total if total else 0.0
+            label_y = max(total, min_label_y)
+            ax.text(bar.get_x() + bar.get_width() / 2, label_y, f"{goodput_pct:.0f}%",
+                    ha="center", va="bottom", fontsize=7)
 
     ax.set_xticks(list(x))
     ax.set_xticklabels([f"M={m}" for m in ms])
@@ -770,7 +789,7 @@ def plot_e3_queue(queue_traces, buffer, topo_goodput, compare_m, out_path):
         colors[m] = palette[i % len(palette)]
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    drain_times_ms = []
+    drain_times_ms = {}
     for m in ms:
         series, drop_times_ns = queue_traces[m]
         if not series:
@@ -786,11 +805,18 @@ def plot_e3_queue(queue_traces, buffer, topo_goodput, compare_m, out_path):
         # flat empty queue that would otherwise swamp the interesting part
         peak_idx = max(range(len(lens)), key=lambda i: lens[i])
         drain_idx = next((i for i in range(peak_idx, len(lens)) if lens[i] == 0), len(lens) - 1)
-        drain_times_ms.append(times_ms[drain_idx])
+        drain_times_ms[m] = times_ms[drain_idx]
 
     ax.axhline(buffer, color="gray", linestyle="--", linewidth=1, label=f"buffer limit ({buffer} packets)")
     if drain_times_ms:
-        ax.set_xlim(0, max(drain_times_ms) * 1.3)
+        x_max = max(drain_times_ms.values()) * 1.3
+        ax.set_xlim(0, x_max)
+        worst_m = max(drain_times_ms)  # the M with the longest fill/drain cycle -- the one that actually collapses
+        drain_t = drain_times_ms[worst_m]
+        ax.annotate("then idle ~200ms waiting for\nthe timeout (see previous figure)",
+                    xy=(drain_t, 2), xytext=(min(drain_t + x_max * 0.08, x_max * 0.98), buffer * 0.3),
+                    fontsize=8, color=colors[worst_m],
+                    arrowprops=dict(arrowstyle="->", color=colors[worst_m], lw=1))
     ax.set_xlabel("time (ms)")
     ax.set_ylabel("queue length (packets)")
     ax.set_title("You can see the buffer fill and overflow")

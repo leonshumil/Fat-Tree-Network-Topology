@@ -11,6 +11,7 @@ figures/*.png. Subcommands, one per experiment (PHASE2_PROMPT.md Step 5):
 import argparse
 import copy
 import csv
+import itertools
 import os
 import random
 import sys
@@ -263,7 +264,19 @@ def cmd_throughput_vs_failures(args):
     print(f"wrote {plot_throughput_vs_failures(rows, args.ks, schemes, args.plot)}")
 
 
-# --- e1-resilience (Phase 4, PHASE4.md Step 4) --------------------------------------------------------------------
+# --- e1-resilience (Phase 4, PHASE4.md Step 4; PHASE5.md Step 1) --------------------------------------------------------------------
+
+def _e1_pod_pairs(k, seed):
+    """Pod pairs to average path_diversity over: all C(k,2) pairs when
+    that's small enough (k <= 8), else a fixed seeded sample of 8 -- a
+    single representative pod pair was a noisy sample on its own, even
+    after path_diversity's own per-pair averaging over edge switches
+    (PHASE5.md Step 1)."""
+    all_pairs = list(itertools.combinations(range(k), 2))
+    if k <= 8:
+        return all_pairs
+    return random.Random(seed).sample(all_pairs, 8)
+
 
 def cmd_e1_resilience(args):
     """What breaks when random parts of the network fail, and does it matter
@@ -274,6 +287,7 @@ def cmd_e1_resilience(args):
     rows_conn = []
     for k in args.ks:
         g = build_fat_tree(k)
+        pod_pairs = _e1_pod_pairs(k, args.seed)
         for pct in args.pcts:
             fc_vals, pd_vals = [], []
             for t in range(args.trials):
@@ -283,7 +297,7 @@ def cmd_e1_resilience(args):
                 }
                 g2, _ = apply_failures(g, failures_cfg, seed=args.seed + t)
                 fc_vals.append(connectivity_and_path_metrics(g, g2)["fraction_connected"])
-                pd_vals.append(path_diversity(g2, k, 0, 1))
+                pd_vals.append(sum(path_diversity(g2, k, pa, pb) for pa, pb in pod_pairs) / len(pod_pairs))
             fc_mean, fc_ci = _mean_ci95(fc_vals)
             pd_mean, pd_ci = _mean_ci95(pd_vals)
             p = pct / 100

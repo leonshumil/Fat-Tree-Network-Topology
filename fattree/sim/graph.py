@@ -11,6 +11,8 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.csgraph import shortest_path as _sp_shortest_path
 
+from fattree.topology import core_switch_name, pod_switch_name
+
 
 def _switch_subgraph(g):
     """A materialized (not a view) switch-only graph -- views are noticeably
@@ -111,22 +113,79 @@ def connectivity_and_path_metrics(g_before, g_after):
     }
 
 
-def path_diversity(g_after, k, pod_a, pod_b):
-    """Surviving shortest paths between pod_a and pod_b, / (k/2)^2 (CLAUDE.md Sec.
-    6). Within-pod edge<->agg legs are unique per local index, so the number of
-    switch-level shortest paths between a representative edge switch in each pod
-    equals exactly the number of surviving (agg local index, core) combinations."""
+def _canonical_survivor_fraction(g_after, k, pod_a, pod_b, edge_a, edge_b):
+    """Fraction of the (k/2)^2 canonical paths edge_a -> agg(pod_a, a) ->
+    core(a+1, i) -> agg(pod_b, a) -> edge_b (one per (agg local index a,
+    core column i)) that survive, checked by direct link existence --
+    *not* by enumerating nx.all_shortest_paths, which, once every
+    canonical path between a pair is broken, instead returns however many
+    longer detours happen to exist at the new shortest length (real ones:
+    edge_a can reach a *different* local-index agg in its own pod by
+    relaying through a sibling edge switch, since edge<->agg is complete
+    bipartite within a pod -- see PHASE5.md Step 1 and
+    test_path_diversity_detour_does_not_count). None of those detours are
+    one of the (k/2)^2 paths this metric is normalized by; counting them
+    produced upward noise spikes (observed at small k, e.g. k=16 bouncing
+    42%->62%->35% across adjacent failure percentages). A detour isn't
+    diversity; it's a sign the original paths are gone.
+    """
     half = k // 2
-    switch_sub = _switch_subgraph(g_after)
-    edge_a = next((n for n, d in g_after.nodes(data=True) if d["type"] == "edge" and d["pod"] == pod_a), None)
-    edge_b = next((n for n, d in g_after.nodes(data=True) if d["type"] == "edge" and d["pod"] == pod_b), None)
-    if edge_a is None or edge_b is None:
+    survivors = 0
+    for a in range(half):
+        agg_a = pod_switch_name(pod_a, half + a, half)
+        agg_b = pod_switch_name(pod_b, half + a, half)
+        if not (g_after.has_edge(edge_a, agg_a) and g_after.has_edge(agg_b, edge_b)):
+            continue  # the edge->agg / agg->edge legs are shared by every core column
+        row_j = a + 1
+        survivors += sum(
+            1 for i in range(1, half + 1)
+            if g_after.has_edge(agg_a, core_switch_name(row_j, i))
+            and g_after.has_edge(core_switch_name(row_j, i), agg_b)
+        )
+    return survivors / (half * half)
+
+
+def path_diversity(g_after, k, pod_a, pod_b):
+    """Mean, over every (edge switch in pod_a, edge switch in pod_b) pair,
+    of the same quantity `_canonical_survivor_fraction` computes per pair
+    (PHASE5.md Step 1; see that function's docstring for why averaging over
+    every pair, and why only canonical paths count). Vectorized with numpy
+    instead of calling `_canonical_survivor_fraction` edges_a*edges_b times:
+    a naive O((k/2)^4) check per pod-pair (half^2 edge pairs, each
+    rechecking half core columns per agg leg) made `cmd_e1_resilience`'s
+    k=32 rerun not finish in reasonable time, since it now also averages
+    over several pod pairs (`_e1_pod_pairs`) on top of that. The per-(agg
+    local index) core survival count doesn't depend on which edge switch is
+    asking, so it's computed once per row and reused via a matrix product
+    instead of a Python loop -- O((k/2)^3) per pod-pair, ~(k/2)x fewer
+    operations, with `test_path_diversity_matches_canonical_survivor_fraction`
+    checking the two stay in exact agreement.
+    """
+    half = k // 2
+    edges_a = [n for n, d in g_after.nodes(data=True) if d["type"] == "edge" and d["pod"] == pod_a]
+    edges_b = [n for n, d in g_after.nodes(data=True) if d["type"] == "edge" and d["pod"] == pod_b]
+    if not edges_a or not edges_b:
         return 0.0
-    try:
-        n_paths = sum(1 for _ in nx.all_shortest_paths(switch_sub, edge_a, edge_b))
-    except nx.NetworkXNoPath:
-        return 0.0
-    return n_paths / (half * half)
+
+    agg_a_names = [pod_switch_name(pod_a, half + a, half) for a in range(half)]
+    agg_b_names = [pod_switch_name(pod_b, half + a, half) for a in range(half)]
+
+    core_survivors = np.array([
+        sum(
+            1 for i in range(1, half + 1)
+            if g_after.has_edge(agg_a_names[a], core_switch_name(a + 1, i))
+            and g_after.has_edge(core_switch_name(a + 1, i), agg_b_names[a])
+        )
+        for a in range(half)
+    ], dtype=np.float64)
+
+    edge_a_ok = np.array([[g_after.has_edge(ea, agg_a_names[a]) for a in range(half)] for ea in edges_a],
+                          dtype=np.float64)
+    edge_b_ok = np.array([[g_after.has_edge(eb, agg_b_names[a]) for a in range(half)] for eb in edges_b],
+                          dtype=np.float64)
+
+    survivors = (edge_a_ok * core_survivors) @ edge_b_ok.T  # (len(edges_a), len(edges_b))
+    return float(survivors.sum() / (len(edges_a) * len(edges_b)) / (half * half))
 
 
 def oversubscription_stats(g_after, k):
