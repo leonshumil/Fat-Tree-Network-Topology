@@ -436,6 +436,20 @@ def cmd_link_vs_switch(args):
 
 # --- incast (Experiment 9, PHASE3_2_EXP9_INCAST.md) --------------------------------------------------------------------
 
+def _round_time_and_unfinished(flow_stats, duration_ns):
+    """A round's wall time and straggler count, given its flows' FlowStats
+    and the simulation's time budget. If *any* flow in the round didn't
+    finish, the round isn't over once the others do -- that would undercount
+    its real time (PHASE6.md Step 1: a round with an unfinished flow was
+    timed by its finished flows only, making it look faster than it was,
+    which could even read as a physically impossible >=100% goodput). Such a
+    round is charged the full simulated budget instead."""
+    unfinished = sum(1 for fs in flow_stats.values() if fs.fct_ns() is None)
+    if unfinished > 0:
+        return duration_ns, unfinished
+    return max(fs.fct_ns() for fs in flow_stats.values()), 0
+
+
 def _run_incast_rounds(g, router, cfg, m, rounds, seed):
     """Run `rounds` sequential, barrier-synchronized incast rounds: round r+1's
     M requests start only once round r's M responses have all finished (or the
@@ -462,6 +476,8 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
     total_time_ns = 0
     total_timeouts = 0
     total_fast_retx = 0
+    total_unfinished = 0
+    n_senders = None
     drops_by_layer = {"host": 0, "edge": 0, "agg": 0, "core": 0}
     receiver_drops = 0
     max_receiver_queue = 0
@@ -471,13 +487,14 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
 
     for r in range(rounds):
         pairs = generate_pairs(g, cfg, seed=seed + r)
+        n_senders = len(pairs)  # same every round (same m/placement/receiver); PHASE6.md Step 1
         jitter_rng = random.Random(seed + r + 500_000)
         flows = [Flow(src, dst, block_bytes, jitter_rng.uniform(0, start_jitter_s), "mouse") for src, dst in pairs]
         sim = PacketSimulator(g, router, flows, cfg)
         result = sim.run()
 
-        finished = [fs.fct_ns() for fs in result["flow_stats"].values() if fs.fct_ns() is not None]
-        round_time_ns = max(finished) if finished else sim.duration_ns
+        round_time_ns, unfinished_this_round = _round_time_and_unfinished(result["flow_stats"], sim.duration_ns)
+        total_unfinished += unfinished_this_round
         round_times_ns.append(round_time_ns)
         total_time_ns += round_time_ns
 
@@ -520,6 +537,8 @@ def _run_incast_rounds(g, router, cfg, m, rounds, seed):
         "p99_round_time_ns": p99_round_ns,
         "receiver_queue_series": receiver_queue_series,
         "receiver_drop_times_ns": receiver_drop_times_ns,
+        "unfinished_flows": total_unfinished,
+        "n_senders": n_senders,
     }
 
 
@@ -634,12 +653,16 @@ def cmd_e3_incast(args):
         for m in args.ms:
             cfg = _e3_base_cfg(k, args.block_bytes, args.rounds, args.duration_ms, q, 200)
             router = get_router("two-level", g, cfg)
-            goodputs = [_run_incast_rounds(g, router, cfg, m, args.rounds, seed=args.seed + t * 1000)["goodput_bps"]
-                        for t in range(args.trials)]
+            trial_stats = [_run_incast_rounds(g, router, cfg, m, args.rounds, seed=args.seed + t * 1000)
+                           for t in range(args.trials)]
+            goodputs = [s["goodput_bps"] for s in trial_stats]
+            unfinished = sum(s["unfinished_flows"] for s in trial_stats)
             mean, ci95 = _mean_ci95(goodputs)
             collapse_rows.append({"queue_size_packets": q, "m": m,
-                                   "goodput_pct": 100 * mean / cap_bps, "goodput_ci95_pct": 100 * ci95 / cap_bps})
-            print(f"buffer={q:>3} M={m:>3}  goodput={100 * mean / cap_bps:5.1f}% (+/-{100 * ci95 / cap_bps:.1f})")
+                                   "goodput_pct": 100 * mean / cap_bps, "goodput_ci95_pct": 100 * ci95 / cap_bps,
+                                   "unfinished_flows": unfinished})
+            print(f"buffer={q:>3} M={m:>3}  goodput={100 * mean / cap_bps:5.1f}% (+/-{100 * ci95 / cap_bps:.1f})"
+                  f"{'  [unfinished=' + str(unfinished) + ']' if unfinished else ''}")
 
     # --- Figure 2: where time goes, one buffer size, min RTO 200ms vs 1ms ---
     time_rows = []
@@ -647,14 +670,27 @@ def cmd_e3_incast(args):
         for m in args.ms:
             cfg = _e3_base_cfg(k, args.block_bytes, args.rounds, args.duration_ms, args.time_buffer, min_rto)
             router = get_router("two-level", g, cfg)
-            round_times_ns = [_run_incast_rounds(g, router, cfg, m, args.rounds, seed=args.seed + t * 1000)["mean_round_time_ns"]
-                               for t in range(args.trials)]
-            mean_round_ns = sum(round_times_ns) / len(round_times_ns)
-            ideal_send_ns = m * args.block_bytes * 8 * 1e9 / cap_bps
-            waiting_ns = max(0.0, mean_round_ns - ideal_send_ns)
+            trial_stats = [_run_incast_rounds(g, router, cfg, m, args.rounds, seed=args.seed + t * 1000)
+                           for t in range(args.trials)]
+            mean_round_ns = sum(s["mean_round_time_ns"] for s in trial_stats) / len(trial_stats)
+            unfinished = sum(s["unfinished_flows"] for s in trial_stats)
+            n_senders = trial_stats[0]["n_senders"]  # same every trial (same m/placement/receiver)
+            # Ideal sending time uses the senders actually created, not the
+            # requested m (PHASE6.md Step 1): generate_pairs now raises
+            # rather than silently creating fewer, but deriving this from the
+            # real flow count is the more robust fix either way.
+            ideal_send_ns = n_senders * args.block_bytes * 8 * 1e9 / cap_bps
+            waiting_ns = mean_round_ns - ideal_send_ns
+            if waiting_ns < 0:
+                raise RuntimeError(
+                    f"negative waiting time ({waiting_ns / 1e6:.3f}ms) at min_rto_ms={min_rto} M={m} "
+                    f"(n_senders={n_senders}): measurement bug, not a real result"
+                )
             time_rows.append({"min_rto_ms": min_rto, "m": m,
-                               "sending_ms": ideal_send_ns / 1e6, "waiting_ms": waiting_ns / 1e6})
-            print(f"min_rto_ms={min_rto:>3} M={m:>3}  sending={ideal_send_ns / 1e6:.2f}ms waiting={waiting_ns / 1e6:.2f}ms")
+                               "sending_ms": ideal_send_ns / 1e6, "waiting_ms": waiting_ns / 1e6,
+                               "unfinished_flows": unfinished})
+            print(f"min_rto_ms={min_rto:>3} M={m:>3}  sending={ideal_send_ns / 1e6:.2f}ms waiting={waiting_ns / 1e6:.2f}ms"
+                  f"{'  [unfinished=' + str(unfinished) + ']' if unfinished else ''}")
 
     # --- Figure 3: queue trace, M=2 vs M=8, one buffer size, min RTO 200ms ---
     queue_m_values = [m for m in (2, 8) if m in args.ms] or args.ms[:2]
@@ -987,7 +1023,10 @@ def main():
 
     pe3 = sub.add_parser("e3-incast", help="E3: incast -- collapse point, where time goes, queue dynamics (Phase 4)")
     pe3.add_argument("--k", type=int, default=4)
-    pe3.add_argument("--ms", type=int, nargs="+", default=[1, 2, 4, 8, 15])
+    # 12, not 15: k=4's default sender_placement (other-pods) only has 12
+    # hosts outside the receiver's pod -- requesting more now raises
+    # (PHASE6.md Step 1) instead of silently creating fewer senders than asked.
+    pe3.add_argument("--ms", type=int, nargs="+", default=[1, 2, 4, 8, 12])
     pe3.add_argument("--queue-sizes", type=int, nargs="+", default=[32, 64, 128])
     pe3.add_argument("--time-buffer", type=int, default=64, help="buffer size (packets) used for figures 2 and 3")
     pe3.add_argument("--compare-m", type=int, default=8, help="M used for the fat-tree vs. traditional-tree comparison")

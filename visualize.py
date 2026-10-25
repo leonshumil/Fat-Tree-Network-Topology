@@ -13,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 from fattree.config import load_config, validate_config
 from fattree.failures import apply_failures
@@ -735,39 +736,50 @@ def plot_e3_collapse(rows, ms, out_path, init_cwnd=10):
 
 
 def plot_e3_where_time_goes(rows, ms, out_path):
-    """Stacked bars per M: average round time split into sending data vs.
-    waiting for timeouts, min RTO 200ms and 1ms side by side."""
-    rtos = [200, 1]
-    rto_colors = {200: "#d00000", 1: "#52b69a"}  # "waiting" color per RTO group
-    send_color = "#2a6f97"
-    width = 0.35
+    """100%-stacked bars per M: share of the round spent sending data
+    (bottom, blue, = goodput) vs. waiting for a timeout (top; red for the
+    200ms floor, green for 1ms), one pair of bars (200ms | 1ms) per M.
+
+    Replaces an earlier design (PHASE6.md Step 2) where bar *height* was
+    round time (tall = slow) but the label on it was goodput (high = good)
+    -- readers saw "2%" sitting high on a tall bar and "72%" low on a short
+    bar and read it backwards. Every bar here is the same 100%-tall shape;
+    only the split changes, so tall-blue always means "mostly useful."
+    """
+    rtos = [(200, "#D0021B", "200 ms timeout"), (1, "#4DB89A", "1 ms timeout")]
+    send_color = "#2C6E99"
+    width = 0.36
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    x = range(len(ms))
-    all_totals = [r["sending_ms"] + r["waiting_ms"] for r in rows]
-    y_max = max(all_totals) if all_totals else 1.0
-    min_label_y = 0.02 * y_max  # M=1/M=2 bars are under 1ms, invisible on a ~250ms axis without a label floor
+    x = list(range(len(ms)))
 
-    for i, rto in enumerate(rtos):
+    for i, (rto, wait_color, rto_label) in enumerate(rtos):
         rto_rows = {r["m"]: r for r in rows if r["min_rto_ms"] == rto}
-        sending = [rto_rows[m]["sending_ms"] for m in ms]
-        waiting = [rto_rows[m]["waiting_ms"] for m in ms]
         offsets = [xi + (i - 0.5) * width for xi in x]
-        bars = ax.bar(offsets, sending, width, color=send_color, label="sending data" if i == 0 else None)
-        ax.bar(offsets, waiting, width, bottom=sending, color=rto_colors[rto],
-               label=f"waiting (min RTO {rto}ms)")
-        for bar, s, w in zip(bars, sending, waiting):
+        for xi, m in zip(offsets, ms):
+            r = rto_rows[m]
+            s, w = r["sending_ms"], r["waiting_ms"]
             total = s + w
             goodput_pct = 100 * s / total if total else 0.0
-            label_y = max(total, min_label_y)
-            ax.text(bar.get_x() + bar.get_width() / 2, label_y, f"{goodput_pct:.0f}%",
-                    ha="center", va="bottom", fontsize=7)
+            ax.bar(xi, goodput_pct, width, color=send_color)
+            ax.bar(xi, 100 - goodput_pct, width, bottom=goodput_pct, color=wait_color)
+            total_label = f"{total:.1f} ms" if total < 10 else f"{total:.0f} ms"
+            ax.text(xi, 102, total_label, ha="center", fontsize=9)
+            ax.text(xi, max(goodput_pct / 2, 4), f"{goodput_pct:.0f}%", ha="center", va="center",
+                    color="white", fontsize=10, fontweight="bold")
 
-    ax.set_xticks(list(x))
-    ax.set_xticklabels([f"M={m}" for m in ms])
-    ax.set_ylabel("mean round time (ms)")
-    ax.set_title("A 200ms timeout costs far more than the data itself ever takes to send")
-    ax.legend(frameon=False, fontsize=9)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"M={m}\n200ms | 1ms" for m in ms])
+    ax.set_ylabel("share of round time (%)")
+    ax.set_ylim(0, 112)
+    ax.set_title("With a 200ms timeout, almost the whole round is spent waiting")
+    legend_handles = [
+        Patch(color=rtos[0][1], label=f"waiting ({rtos[0][2]})"),
+        Patch(color=rtos[1][1], label=f"waiting ({rtos[1][2]})"),
+        Patch(color=send_color, label="sending data (useful)"),
+    ]
+    ax.legend(handles=legend_handles, frameon=False, fontsize=9, ncol=3,
+              loc="upper center", bbox_to_anchor=(0.5, -0.15))
     _no_top_right_spines(ax)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

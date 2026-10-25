@@ -2,10 +2,11 @@ import copy
 
 import pytest
 
-from analysis import _run_incast_rounds
+from analysis import _round_time_and_unfinished, _run_incast_rounds
 from fattree.config import DEFAULTS
 from fattree.routing import get_router
 from fattree.sim.packet import PacketSimulator, simulate_packets
+from fattree.sim.packet_metrics import FlowStats
 from fattree.topology import build_fat_tree, hosts_of
 from fattree.traffic import Flow
 
@@ -80,6 +81,51 @@ def test_incast_conservation():
     sim = PacketSimulator(g, router, flows, cfg_round)
     result = sim.run()
     assert result["total_sent"] == result["total_delivered"] + result["total_dropped"]
+
+
+# --- round timing with a straggler (PHASE6.md Step 1) --------------------------------------------------------------------
+
+def test_round_time_charges_full_budget_when_a_flow_is_unfinished():
+    """A round where one flow finished quickly and another never finished
+    must be timed by the simulation's full budget, not by the finished
+    flow's (much shorter) FCT -- the old bug made such a round look faster
+    than it really was."""
+    duration_ns = 50_000_000  # 50ms budget
+    fast = FlowStats(0, "mouse", 1000, start_time_ns=0)
+    fast.finish(2_000_000)  # finished at 2ms
+    slow = FlowStats(1, "mouse", 1000, start_time_ns=0)  # never finished
+
+    round_time_ns, unfinished = _round_time_and_unfinished({0: fast, 1: slow}, duration_ns)
+    assert round_time_ns == duration_ns
+    assert unfinished == 1
+
+
+def test_round_time_uses_max_fct_when_everyone_finishes():
+    duration_ns = 50_000_000
+    a = FlowStats(0, "mouse", 1000, start_time_ns=0)
+    a.finish(2_000_000)
+    b = FlowStats(1, "mouse", 1000, start_time_ns=0)
+    b.finish(5_000_000)
+
+    round_time_ns, unfinished = _round_time_and_unfinished({0: a, 1: b}, duration_ns)
+    assert round_time_ns == 5_000_000
+    assert unfinished == 0
+
+
+# --- where-time-goes waiting time is never negative (PHASE6.md Step 1) --------------------------------------------------------------------
+
+def test_incast_waiting_time_never_negative_for_a_small_sweep():
+    k = 4
+    g = build_fat_tree(k)
+    cap_bps = DEFAULTS["link_capacity_gbps"] * 1e9
+    for min_rto_ms in (200, 1):
+        cfg = _base_cfg(k, queue_size=64, min_rto_ms=min_rto_ms, duration_ms=3000)
+        router = get_router("two-level", g, cfg)
+        for m in (1, 2, 4):
+            stats = _run_incast_rounds(g, router, cfg, m=m, rounds=5, seed=1)
+            ideal_send_ns = stats["n_senders"] * cfg["incast"]["block_bytes"] * 8 * 1e9 / cap_bps
+            waiting_ns = stats["mean_round_time_ns"] - ideal_send_ns
+            assert waiting_ns >= 0, f"min_rto_ms={min_rto_ms} m={m}: waiting_ns={waiting_ns}"
 
 
 # --- determinism --------------------------------------------------------------------

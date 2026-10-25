@@ -102,12 +102,25 @@ def _pattern_all_to_all(g, hosts, cfg, rng):
     return [(src, dst) for src in hosts for dst in hosts if src != dst]
 
 
+_INCAST_PLACEMENT_DESC = {
+    "other-pods": "in other pods",
+    "same-pod": "in the same pod",
+    "random": "in the network",
+}
+
+
 def _pattern_incast(g, hosts, cfg, rng):
     """M senders -> 1 receiver (PHASE3_2_EXP9_INCAST.md). `incast.receiver`
     defaults to the first host of pod 0 (`hosts[0]`, since hosts_of() sorts by
     (pod, switch, host_id)); `incast.sender_placement` controls which hosts are
     eligible senders: other-pods (default, the classic incast setup) | same-pod
-    | random (any host)."""
+    | random (any host).
+
+    Raises if there aren't enough eligible hosts for the requested M (PHASE6.md
+    Step 1): silently creating fewer senders than requested used to produce a
+    physically impossible >=100% goodput reading in analysis.py's e3-incast
+    (the "ideal" time was computed from the requested M, not the actual, smaller,
+    flow count)."""
     incast_cfg = cfg.get("incast", {})
     m = cfg["traffic"].get("incast_senders", 8)
 
@@ -123,7 +136,15 @@ def _pattern_incast(g, hosts, cfg, rng):
     else:
         raise ValueError(f"unknown incast.sender_placement: {placement!r}")
 
-    m = min(m, len(candidates))
+    if m > len(candidates):
+        k = cfg.get("topology", {}).get("k")
+        k_note = f" at k={k}" if k is not None else ""
+        desc = _INCAST_PLACEMENT_DESC.get(placement, placement)
+        raise ValueError(
+            f"incast: requested {m} senders but only {len(candidates)} hosts are {desc}{k_note}; "
+            f"use M <= {len(candidates)} or a different sender_placement"
+        )
+
     senders = rng.sample(candidates, m)
     return [(src, dst) for src in senders]
 

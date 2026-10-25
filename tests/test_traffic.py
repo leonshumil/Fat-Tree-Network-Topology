@@ -129,6 +129,32 @@ def test_incast_explicit_receiver_honored():
     assert all(d == explicit_receiver for _, d in pairs)
 
 
+# --- incast sender-count bug (PHASE6.md Step 1) --------------------------------------------------------------------
+
+def test_incast_requesting_more_senders_than_available_raises():
+    """k=4, other-pods placement: only 12 hosts (3 pods x 4 hosts) are
+    outside the receiver's pod. Requesting M=15 used to silently create
+    only 12 senders (analysis.py then computed the "ideal" time for 15,
+    producing a physically impossible >=100% goodput reading) -- it must
+    raise instead."""
+    g = build_fat_tree(4)
+    cfg = _cfg(pattern="incast", incast_senders=15)
+    cfg["topology"]["k"] = 4
+    cfg["incast"] = {"sender_placement": "other-pods"}
+    with pytest.raises(ValueError, match="15 senders but only 12"):
+        generate_pairs(g, cfg, seed=1)
+
+
+def test_incast_exactly_the_available_sender_count_succeeds():
+    g = build_fat_tree(4)
+    cfg = _cfg(pattern="incast", incast_senders=12)
+    cfg["topology"]["k"] = 4
+    cfg["incast"] = {"sender_placement": "other-pods"}
+    pairs = generate_pairs(g, cfg, seed=1)
+    assert len(pairs) == 12
+    assert len({src for src, _ in pairs}) == 12
+
+
 # --- staggered --------------------------------------------------------------------
 
 def test_staggered_subnet_p_1_always_same_edge_switch():

@@ -19,7 +19,7 @@ python3 analysis.py e2-throughput --k 16 --pcts 0 5 10 15 20 25 30 \
     --ks 4 8 16 24 32 --trials 20
 
 echo "=== Experiment 3: Incast ==="
-python3 analysis.py e3-incast --ms 1 2 4 8 15 --queue-sizes 32 64 128 \
+python3 analysis.py e3-incast --ms 1 2 4 8 12 --queue-sizes 32 64 128 \
     --time-buffer 64 --compare-m 8 --rounds 20 --trials 10
 
 end_ts=$(date +%s)

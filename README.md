@@ -2,15 +2,15 @@
 
 Homework 1, course 361.2.2460 — Data Center & AI Networking (BGU, semester A 2026/27).
 
-Three findings drive this submission: (1) a fat-tree's survival under random failures is
-governed almost exactly by simple closed-form formulas, and bigger `k` buys
-disproportionately more fault tolerance; (2) even with **zero** failures, per-flow hash
-routing (ECMP/two-level) wastes roughly half of the network's promised bisection
-bandwidth to hash collisions — a real gap from the paper's own Sec. 5.3 expectation, and
-the exact motivation for the same authors' later Hedera scheduler; (3) incast collapses
-abruptly at a predictable number of senders, and the cause is almost entirely a 200ms
-TCP timeout, not a lack of bisection bandwidth — the fat-tree's rich core does essentially
-nothing to help, because the bottleneck is the receiver's own last cable.
+Three things stood out. **(1) Bigger networks survive failures far better:** with 60% of
+links down, a `k=32` network is still 99.95% connected, while a `k=8` network drops below
+99.9% connected at just 15%. **(2) Even with zero failures, hash-based routing wastes
+about half the network's promised bandwidth:** `two-level` routing only reaches 44.7% of
+ideal at `k=32`, not the ~65% a simple estimate predicts — the opposite of what the paper
+itself expected. **(3) Incast collapses sharply once too many servers answer at once, and
+it's mostly a timer problem:** at 8 senders, cutting the retry timeout from 200ms to 1ms
+recovers most of the lost speed — though a rare retry pathology can still stall a few
+rounds badly even then.
 
 > M. Al-Fares, A. Loukissas, A. Vahdat, "A Scalable, Commodity Data Center Network
 > Architecture," SIGCOMM Comput. Commun. Rev., vol. 38, no. 4, pp. 63–74, Oct. 2008,
@@ -57,7 +57,7 @@ python visualize.py --k 8 --topology-type traditional-tree --link-pct 5 --seed 1
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v          # 204 tests
+python -m pytest tests/ -v          # 209 tests
 
 # Experiment 1: Resilience -- what breaks, and how much it matters
 python analysis.py e1-resilience --ks 8 16 32 \
@@ -69,7 +69,7 @@ python analysis.py e2-throughput --k 16 --pcts 0 5 10 15 20 25 30 \
     --ks 4 8 16 24 32 --trials 20
 
 # Experiment 3: Incast
-python analysis.py e3-incast --ms 1 2 4 8 15 --queue-sizes 32 64 128 \
+python analysis.py e3-incast --ms 1 2 4 8 12 --queue-sizes 32 64 128 \
     --time-buffer 64 --compare-m 8 --rounds 20 --trials 10
 
 # or, all of the above in one command:
@@ -130,16 +130,19 @@ uses the cheapest level that still answers its question:
 
 ## Results
 
+Each figure below follows the same four-part explanation: **how to read it** (axes,
+colors), **what it shows** (the key numbers), **why** (the mechanism, in plain words),
+**so what** (why it matters). `k` = switch port count, the one parameter that sets the
+whole network's size (see [The topology](#the-topology)).
+
 ### Experiment 1: Resilience — what breaks, and how much it matters
 
 **Question.** When random parts of the network fail, when do servers lose contact with
 each other, and does it matter *which layer* fails?
 
 **Setup.** Part A: `k ∈ {8,16,32}`, link failure % ∈ `{0,5,...,60}` (bernoulli, fabric
-links only), 30 trials/point — fraction of host pairs connected (`fattree/sim/graph.py`)
-and inter-pod path diversity (surviving shortest paths / `(k/2)²`), each against a
-theory curve. Part B: `k=16` fixed, 5%/10% switch failure in *one* layer at a time
-(edge-only / agg-only / core-only), 30 trials.
+links only), 30 trials/point. Part B: `k=16` fixed, 5%/10% switch failure in *one* layer
+at a time (edge-only / agg-only / core-only), 30 trials.
 
 ```bash
 python analysis.py e1-resilience --ks 8 16 32 --pcts 0 5 ... 60 --trials 30
@@ -147,55 +150,82 @@ python analysis.py e1-resilience --ks 8 16 32 --pcts 0 5 ... 60 --trials 30
 
 ![Bigger fat-trees survive far more broken links: connectivity vs. link failure %, one line per k, with the 1-2p^(k/2) theory curve dashed](figures/e1_connectivity.png)
 
-**Discussion.** The theory curve `1 - 2p^(k/2)` — a server is cut off only once *all*
-`k/2` uplinks of its edge switch fail — tracks the simulation closely at every `k`.
-`k=8` drops below 99.9% connectivity at just 15% link failure; `k=16` survives to 45%;
-`k=32` never drops below 99.9% anywhere in the tested range (still 99.95% connected at
-60% failure). This is the central resilience argument for higher-radix fat-trees: a
-server's isolation probability falls *exponentially* in `k/2`, so each doubling of port
-count buys a dramatically larger safe operating range, not just more hosts.
+**How to read it.** X-axis: % of fabric links (the edge↔aggregation and
+aggregation↔core cables) that fail, picked independently at random. Y-axis: % of server
+pairs that can still reach each other. One solid line per `k`; the dashed line is the
+theory formula for that `k`.
+
+**What it shows.**
+| `k` | drops below 99.9% connected at |
+|---|---|
+| 8 | 15% link failure |
+| 16 | 45% link failure |
+| 32 | never, in the tested range (still 99.95% at 60%) |
+
+**Why.** A server loses contact only once *every one* of its edge switch's `k/2` uplinks
+has failed. Formula: `1 - 2p^(k/2)`, where `p` is the failure probability of one link.
+More uplinks means that "all fail together" event gets rarer very fast as `k` grows —
+each doubling of `k` buys much more than double the safety margin.
+
+**So what.** Picking a bigger switch (higher `k`) buys a data center far more real-world
+fault tolerance, not just more hosts — a concrete reason to prefer higher-radix hardware
+even before counting the extra capacity.
 
 ![Redundancy erodes long before connectivity is lost: surviving inter-pod paths / (k/2)^2 vs. link failure %, with the (1-p)^4 theory curve](figures/e1_path_diversity.png)
 
-**Discussion.** Path diversity (a path survives only if all 4 of its fabric links
-survive, hence `(1-p)^4`) now tracks theory tightly at every `k` — e.g. at 20% link
-failure, measured diversity is 40.0%/40.8%/40.6% for `k=8/16/32` against a theory value
-of 41.0%, each within its 95% CI. The metric counts only paths of the original canonical
-length (edge→agg→core→agg→edge, 4 switch hops / 6 host-to-host hops), averaged over
-*every* edge-switch pair between the two pods, not one representative pair: once a pair's
-canonical paths are all broken, a longer detour through a sibling edge switch is a real
-path in this topology (edge↔agg is a complete bipartite graph within a pod, so a switch
-can relay through a neighbor to reach a different core row) — but it isn't one of the
-`(k/2)²` paths this metric counts, so it's deliberately excluded. Diversity still
-collapses far faster than connectivity regardless: half the paths are gone by the exact
-`(1-p)⁴=0.5` crossing at ~15.9% link failure — well before any of the three `k` values
-has lost a single percentage point of connectivity. This is the mechanism *behind* the
-first figure: the fat-tree stays connected long after it has stopped being genuinely
-redundant, because losing most of the parallel paths between two pods still leaves at
-least one.
+**How to read it.** Same x-axis. Y-axis: **path diversity**, the % of the `(k/2)²`
+separate routes between two pods that still exist — like counting how many different
+roads still connect two cities. Dashed line is the theory formula.
+
+**What it shows.** At the exact point where theory says half the routes are gone
+(`(1-p)⁴ = 0.5`, i.e. ~15.9% link failure), measured diversity for `k=8/16/32` is
+already down to ~50% too, within its 95% CI — and every `k` value in the previous figure
+is still above 99.9% connected at that same point.
+
+**Why.** A route survives only if *all 4* of its links survive: `(1-p)⁴`. The simulation
+counts only the original 4-hop routes, averaged over every pair of edge switches (not
+just one pair, which was too small a sample and gave a noisy, zigzagging result in
+earlier versions of this figure). A longer detour through a neighboring switch can exist
+once the direct routes are gone, but it isn't one of the original `(k/2)²` routes, so it
+isn't counted here.
+
+**So what.** Backup routes disappear much faster than the network actually stops
+working — "still 100% connected" can mean "down to its very last route," which Experiment
+2 shows has a real performance cost.
 
 ![An edge failure cuts off its own servers; core/agg barely touch connectivity: % of server pairs disconnected by failed-switch layer, k=16](figures/e1_layer.png)
 
-**Discussion.** At `k=16`, failing 5%/10% of *edge* switches disconnects 10.8%/20.2% of
-server pairs (close to the `2x` relationship expected from "a pair is disconnected if
-either endpoint is isolated," since each lost edge switch directly orphans its own
-hosts) — while failing the *same percentage* of agg or core switches disconnects
-**exactly 0%** of pairs, because every agg/core switch has `k/2` redundant peers the
-fat-tree can route around instantly. Layer matters enormously more than raw failure
-percentage; a monitoring policy that only tracks "% of switches down" without knowing
-which layer is blind to the one failure mode that actually costs connectivity.
-**Limitation:** this experiment measures connectivity only, not bandwidth — a fully
-connected network can still be badly congested, which is exactly what Experiment 2 covers.
+**How to read it.** Bars: % of server pairs that lose contact when 5% or 10% of the
+switches in *one* layer fail, at `k=16`. Three groups: edge, aggregation, core.
+
+**What it shows.**
+| failed layer | 5% of switches | 10% of switches |
+|---|---|---|
+| edge | 10.8% disconnected | 20.2% disconnected |
+| aggregation | 0% | 0% |
+| core | 0% | 0% |
+
+**Why.** Each edge switch is the *only* connection for the servers plugged directly into
+it, so losing one directly orphans its own servers. Aggregation and core switches each
+have several redundant siblings the network can instantly route around instead.
+
+**So what.** Which layer fails matters far more than how many switches fail — an alert
+that only tracks "% of switches down," without saying which layer, hides the one failure
+type that actually costs connectivity. (This experiment only measures connectivity, not
+speed — a fully-connected network can still be slow, which is what Experiment 2 covers.)
 
 ### Experiment 2: Speed under failures, and the hash-collision ceiling
 
 **Question.** How much of full line-rate speed do servers actually get, with and
 without failures, and how much does the routing scheme change that?
 
-**Setup.** Flow level (max-min fair), random permutation traffic, every host sending at
-line rate, fixed flow size. Three schemes: two-level (paper), two-level with
-`failover: true`, and ECMP. Part A: `k=16`, link failure % ∈ `{0,5,...,30}`, 20 trials.
-Part B: 0% failures, `k ∈ {4,8,16,24,32}`, 20 trials.
+**Setup.** Flow level (every flow gets a fair share of whatever capacity it can reach,
+computed directly, not packet-by-packet), random traffic, every host sending at line
+rate. Three schemes: `two-level` (the paper's own static routing tables), `two-level`
+with `failover` (retries another port instead of giving up), and **ECMP** (Equal-Cost
+Multi-Path: spreads flows across several equally-good live routes, recomputed on the
+fly). Part A: `k=16`, link failure % ∈ `{0,5,...,30}`, 20 trials. Part B: 0% failures,
+`k ∈ {4,8,16,24,32}`, 20 trials.
 
 ```bash
 python analysis.py e2-throughput --k 16 --pcts 0 5 ... 30 --ks 4 8 16 24 32 --trials 20
@@ -203,112 +233,153 @@ python analysis.py e2-throughput --k 16 --pcts 0 5 ... 30 --ks 4 8 16 24 32 --tr
 
 ![Static routing tables lose the most as links fail: throughput (% of ideal) vs. link failure %, one line per scheme, k=16](figures/e2_vs_failures.png)
 
-**Discussion.** All three schemes decline as links fail, but at very different rates.
-**Plain two-level degrades fastest** (46.5%→17.3%, a 62.8% relative drop): its tables are
-static, so a flow whose fixed hop crosses a failed link is simply dropped rather than
-rerouted. **ECMP degrades slowest** (42.8%→34.5%, only 19.4% relative): it recomputes
-shortest paths live on every call, so it reroutes around a failure automatically
-whenever an equal-cost alternative survives. **Enabling `two_level.failover`** recovers
-much of the gap (22.8% vs. 17.3% at 30% failure, a 5.5-point recovery) by retrying
-another live upward port instead of dropping outright — direct, quantitative support for
-the paper's own Sec. 3.8 motivation for adding failover to an otherwise-static scheme.
+**How to read it.** X-axis: link failure %. Y-axis: throughput as a % of ideal (what
+every server would get if nothing ever contended for the same link). One line per
+scheme, `k=16`.
 
-![Hash collisions waste about half the capacity, even with no failures: throughput at 0% failures vs. k, one line per scheme, with the random-hashing theory curve dashed](figures/e2_collision_ceiling.png)
+**What it shows.**
+| scheme | 0% failure | 30% failure |
+|---|---|---|
+| `two-level` | 46.5% | 17.3% |
+| `two-level` + `failover` | 46.5% | 22.8% |
+| ECMP | 42.8% | 34.5% |
 
-**Discussion.** Even at **0% failures**, no scheme gets close to the 100% full
-bisection bandwidth promises. ECMP achieves only 56.6% at `k=4`, falling to 40.9% at
-`k=32`; two-level does somewhat better (64.4%→44.7%, since its ID-based deterministic
-placement happens to spread a full permutation's load slightly more evenly than ECMP's
-independent random hash per flow) — and `two-level` with `failover` is numerically
-identical to plain `two-level` here (omitted from the plot above since it exactly
-overplots `two-level`; still in `results/e2_collision_ceiling.csv`), exactly as expected,
-since failover only changes behavior when something is actually broken.
+**Why.** `two-level`'s routing tables are fixed in advance: if a flow's assigned route
+crosses a failed link, the flow is simply dropped, not rerouted. ECMP recomputes live on
+every call, so it reroutes around a failure automatically whenever another equally-short
+route still exists. `failover` is a small patch to `two-level`: retry one other port
+before giving up.
 
-The paper's Sec. 5.3 states its expectation directly: *"We expect the performance for
-the two-level table to improve for random communication with increasing `k` as there
-will be less likelihood of multiple flows colliding on a single link with higher `k`."*
-The measurement shows the opposite: two-level's throughput at 0% failure *falls* as `k`
-grows, from 64.4% at `k=4` to 44.7% at `k=32` — collisions get worse, not better, as the
-network scales. The analytic **single-hop upper bound** `1 - (1-2/k)^(k/2)` — the
-expected fraction of upward ports used when `k/2` flows hash independently onto `k/2`
-ports *at one switch*, tending to `1-1/e ≈ 63.2%` as `k→∞` — sits visibly above every
-measured curve at every `k` (75.0% vs. 64.4% two-level at `k=4`; 64.4% vs. 44.7% at
-`k=32`), because real routing compounds collisions across **multiple** independent hash
-stages (edge→agg, then agg→core) along a path, not just the one stage this bound models
-— and that compounding gap *widens* with `k` (10.6 points at `k=4`, 19.7 points at
-`k=32`), not narrows. An independent re-implementation (`tests/test_e2_throughput.py`,
-using networkx's own path enumeration and a freshly-written max-min solver, no shared
-code with `fattree/routing`/`fattree/sim/flow`) reproduces `k=8`'s ~47% within
-statistical noise, confirming this isn't a pipeline bug. This directly contradicts the
-paper's own stated expectation, and it is exactly the gap the same authors' later paper,
-Hedera (NSDI 2010), built a central flow scheduler to close.
+**So what.** A routing scheme that looks fine with no failures can lose most of its
+throughput under real-world conditions — failure tolerance has to be designed into the
+routing choice itself, not assumed to come for free.
+
+![Hash collisions waste about half the capacity, even with no failures: throughput at 0% failures vs. k, one line per scheme, with the single-hop upper bound dashed](figures/e2_collision_ceiling.png)
+
+**How to read it.** X-axis: `k`. Y-axis: throughput at 0% failures. Dotted line: the
+100% a fat-tree's design promises (its **bisection bandwidth** — the total capacity
+available between any two halves of the network). Dashed line: a simple estimate for one
+random routing decision. (`two-level` with `failover` is left off this plot — at 0%
+failures it's numerically identical to plain `two-level`, so its line exactly hid the
+other one; the number is still in `results/e2_collision_ceiling.csv`.)
+
+**What it shows.**
+| `k` | `two-level` | ECMP | single-hop estimate |
+|---|---|---|---|
+| 4 | 64.4% | 56.6% | 75.0% |
+| 32 | 44.7% | 40.9% | 64.4% |
+
+**Why.** A **hash collision** is two flows, each picked by an independent coin flip,
+landing on the same output port and having to share it — like two cars from different
+on-ramps merging into one lane. Real routing makes this coin flip at *two* separate hops
+(edge→aggregation, then aggregation→core), not the one hop the dashed estimate models,
+so collisions compound — and that gap gets *wider*, not narrower, as `k` grows. The
+paper expected the opposite, in its own words: *"We expect the performance for the
+two-level table to improve for random communication with increasing `k` as there will be
+less likelihood of multiple flows colliding on a single link with higher `k`."* The
+measurement shows `two-level` actually getting worse with `k` (64.4% → 44.7%), not
+better. An independent re-implementation (`tests/test_e2_throughput.py`, sharing no code
+with the main routing/flow modules) reproduces the same ~47% at `k=8`, confirming this
+isn't a pipeline bug.
+
+**So what.** Even a perfectly healthy fat-tree doesn't deliver its promised bandwidth
+under ordinary random traffic. This real gap is exactly what motivated the same authors'
+follow-up paper, Hedera (NSDI 2010), to add a central scheduler that actively avoids
+collisions instead of hoping random hashing avoids them.
 
 ### Experiment 3: Incast
 
-**Question.** When many servers answer one server at nearly the same moment
-(partition/aggregate — a search fan-out, an AI all-reduce), why does throughput
-collapse, what actually controls the collapse point, and does the fat-tree's full
-bisection bandwidth help at all?
+**Question.** When many servers answer one server at nearly the same moment (an
+**incast** — e.g. a search query fanning out to many backends, all replying together),
+why does throughput collapse, what controls the collapse point, and does the fat-tree's
+extra core capacity help at all?
 
-**In one number.** 8 senders × 64 KB = 512 KB arriving at a 96 KB (64-packet) receiver
-buffer. Sending that much data at line rate takes only ~4.2ms — but one lost packet
-means a 200ms minimum RTO wait. 4.2 / (4.2 + 200) ≈ 2% goodput, and that is almost
-exactly what was measured (1.8%).
-
-**Setup.** Packet level, `tcp_lite` (fixed in this submission, see
-[Limitations](#limitations)), `k=4`, `M ∈ {1,2,4,8,15}` senders, 64 KB block per sender
-per round, 20 barrier-synchronized rounds, 10 trials, buffer ∈ `{32,64,128}` packets,
-min RTO ∈ `{200ms, 1ms}`, each sender's request jittered by a few random microseconds
-(`incast.start_jitter_us`) so the burst isn't an unrealistic perfect lockstep collision.
+**Setup.** Packet level (the only level that models queues, drops, and timeouts), `k=4`,
+`tcp_lite` transport (see [Limitations](#limitations)), `M ∈ {1,2,4,8,12}` senders (12 =
+every host outside the receiver's pod at `k=4`; higher values raise an error rather than
+silently using fewer senders, see `fattree/traffic.py`), 64 KB block per sender per
+round, 20 barrier-synchronized rounds, 10 trials, receiver **buffer** (queue) size ∈
+`{32,64,128}` packets, minimum retry **timeout (RTO)** ∈ `{200ms, 1ms}`.
 
 ```bash
-python analysis.py e3-incast --ms 1 2 4 8 15 --queue-sizes 32 64 128 \
+python analysis.py e3-incast --ms 1 2 4 8 12 --queue-sizes 32 64 128 \
     --time-buffer 64 --compare-m 8 --rounds 20 --trials 10
 ```
 
 ![A bigger buffer only delays the incast collapse: goodput (% of receiver line rate) vs. number of senders M, one line per buffer size, min RTO 200ms](figures/e3_collapse.png)
 
-**Discussion.** Textbook incast collapse, and the collapse point is predictable: after
-one RTT of slow start a sender's window is `2 × init_cwnd` (= 20 packets here), so a
-buffer overflows once `M × 2 × init_cwnd` exceeds it, i.e. `M* ≈ buffer / (2×init_cwnd)`
-— `32→1.6`, `64→3.2`, `128→6.4`. The measured collapse lands at **M=2, 4, 8** for
-buffers 32, 64, 128 respectively — matching the rounded-up analytic estimate exactly. A
-bigger buffer doesn't prevent collapse, it only moves the cliff to a larger `M`.
+**How to read it.** X-axis: number of senders `M` answering at once. Y-axis:
+**goodput** — the % of the receiver's own cable capacity actually delivered as useful
+data. One line per receiver buffer size.
 
-![A 200ms timeout costs far more than the data itself ever takes to send: mean round time split into sending data vs. waiting for timeouts, buffer=64, min RTO 200ms vs. 1ms](figures/e3_where_time_goes.png)
+**What it shows.**
+| buffer | collapses once `M` reaches |
+|---|---|
+| 32 packets | 2 |
+| 64 packets | 4 |
+| 128 packets | 8 |
 
-**Discussion.** At `M=8`, sending the data itself takes 4.2ms — but with a 200ms
-minimum RTO, the *mean round time* is 230ms, i.e. **226ms of pure timeout waiting**
-(a 2% goodput, labeled above each bar). Dropping the minimum RTO to 1ms cuts that same
-round's waiting time to under 2ms (68% goodput) — a >100x reduction — with send time
-completely unchanged, because the data was never the problem. At `M=15` with the 1ms
-floor, measured waiting time is exactly **zero** (100% goodput): with 15 senders in
-flight, some sender always has data ready to (re)send, so any individual timeout
-overlaps with other senders' ongoing transmissions and the receiver's cable is never
-actually idle — "waiting" counts only idle time, not retransmission activity happening
-in parallel elsewhere. This is a direct, quantitative reproduction of Vasudevan et al.'s
-(SIGCOMM 2009) central claim: the 200ms RTO floor is a wide-area-network TCP default,
-wildly mismatched to a sub-millisecond datacenter RTT, and most of incast's cost is a
-*timer* problem, not a *capacity* problem.
+**Why.** A sender's window starts small and doubles each round trip; after the first
+round trip it's `2 × init_cwnd` (20 packets here). Once that many senders' data arrives
+together, the buffer — sized to hold only so many packets — overflows, packets are lost,
+and TCP must wait out a full timeout before trying again. The collapse point matches
+`buffer / (2 × init_cwnd)`, rounded up: `32→2`, `64→4`, `128→8`.
+
+**So what.** A bigger buffer only delays the cliff, it doesn't remove it — buying bigger
+buffers alone is not a real fix for incast.
+
+![With a 200ms timeout, almost the whole round is spent waiting: share of round time spent sending vs. waiting, one pair of bars per M, 200ms timeout vs. 1ms timeout](figures/e3_where_time_goes.png)
+
+**How to read it.** Each bar is one round of incast (every answer received), shown as
+100% of that round's time. Blue = share spent actually sending data (this *is* the
+goodput number, printed in white). Red/green = share spent waiting out a timeout. Left
+bar in each pair = the normal 200ms timeout, right = a 1ms timeout. The number above each
+bar is the real mean round time.
+
+**What it shows.**
+| senders | 200ms timeout | 1ms timeout |
+|---|---|---|
+| 4 | 104ms round, 2% useful | 2.9ms round, 72% useful |
+| 8 | 282ms round, 1% useful | 51ms round, 8% useful |
+| 12 | 204ms round, 3% useful | 7.8ms round, 81% useful |
+
+**Why.** Sending 8 × 64 KB only takes ~4ms — but one lost packet makes TCP wait out the
+*entire* timeout before resending, and 200ms is 50x longer than the data itself takes.
+At `M=8` specifically, a rare pattern (well under 1% of rounds, confirmed by direct
+inspection) has a few senders retransmit into each other repeatedly without making real
+progress; those rounds get charged the full 3-second simulation budget each, which pulls
+the `M=8` average up a lot even though almost every other round is fine — this is why
+`M=8`'s 1ms-timeout bar (8% useful) looks worse than `M=4`'s or `M=12`'s, breaking what
+would otherwise be a smooth trend.
+
+**So what.** Incast is mainly a timer problem, not a capacity problem: shrinking the
+timeout recovers most of the lost speed (Vasudevan et al., SIGCOMM 2009) — though the
+rare retry pathology above shows a timeout fix alone doesn't catch every case.
 
 ![You can see the buffer fill and overflow: queue length at the receiver's edge port over one round, M=2 vs. M=8, buffer=64, drops marked with x](figures/e3_queue.png)
 
-**Discussion.** At `M=2` the queue never reaches the 64-packet buffer limit and drains
-cleanly in about 1ms. At `M=8`, the queue fills to the buffer limit within ~0.8ms,
-plateaus (new arrivals are dropped the instant anything leaves, visible as the `x`
-marker), and only drains ~1.3ms later once the senders' windows have collapsed — the
-entire fill-plateau-drain cycle takes under 3ms, dwarfed by the 200ms timeout that
-follows it (not shown on this zoomed-in panel; see the previous figure). The inset
-compares fat-tree vs. traditional-tree goodput at `M=8`: **1.8% vs. 1.8%, identical**.
-The fat-tree's richer core does not help at all, because the bottleneck was never the
-core — it is the receiver's own single last-hop cable, which has exactly the same
-capacity regardless of how many parallel paths exist upstream of it.
+**How to read it.** X-axis: time within a single round, zoomed to the first few
+milliseconds. Y-axis: how many packets are waiting at the receiver's own port. Dashed
+line: the buffer's limit. `x`: a packet arriving and being dropped because the buffer is
+already full.
 
-**Real-world fixes** this motivates (not implemented here): bigger receiver buffers
-(delays but doesn't prevent collapse, per above), a much smaller RTO (the direct fix
-demonstrated here), DCTCP-style ECN marking to signal congestion before a drop is
-needed at all, or receiver-driven transport protocols (Homa, NDP) that sidestep the
-sender-paced-retransmission model entirely.
+**What it shows.**
+| senders | buffer behavior |
+|---|---|
+| 2 | never reaches the limit; drains in ~1ms |
+| 8 | fills to the limit by ~0.8ms, stays full (dropping), drains by ~2.9ms |
+
+**Why.** More senders means more data arrives in the same instant: eight 64 KB blocks
+land together, simply more than a 64-packet buffer can hold at once, so the extra
+packets are dropped on arrival.
+
+**So what.** fat-tree vs. traditional-tree goodput at `M=8` is nearly identical (1.6% vs.
+1.8%, see the inset) — the fat-tree's richer core does not help here, because the jam
+happens on the receiver's own single last-hop cable, a bottleneck no amount of extra core
+capacity can widen. Real fixes (not implemented here): a much smaller RTO (shown above),
+DCTCP-style ECN marking to signal congestion before a drop is even needed, or
+receiver-driven transport protocols (Homa, NDP) that sidestep sender-paced retransmission
+entirely.
 
 ## Limitations
 
@@ -334,7 +405,7 @@ sender-paced-retransmission model entirely.
 python -m pytest tests/ -v
 ```
 
-204 tests, all passing. Validation highlights relevant to this submission: exact
+209 tests, all passing. Validation highlights relevant to this submission: exact
 packet-level delay/drop/reordering formulas and an M/D/1 queueing-theory check
 (`tests/test_packet_sim.py`); a sent = delivered + dropped conservation invariant under
 load; the Phase 4 TCP fix specifically — a 10-packet burst loss recovers with exactly 1
@@ -343,7 +414,10 @@ and an incast smoke test confirms a 1ms minimum RTO gives ≥5x the goodput of 2
 Phase 5 path-diversity fix — healthy diversity is exactly 1.0, a hand-built single-link
 removal gives exactly 0.75 at `k=4`, a constructed case confirms a real but
 longer-than-canonical detour does *not* count as a surviving path, and a 200-trial Monte
-Carlo at `k=8, p=0.2` lands within 0.02 of `(1-p)⁴`;
+Carlo at `k=8, p=0.2` lands within 0.02 of `(1-p)⁴`; the Phase 6 incast fix — requesting
+more senders than exist raises instead of silently under-creating them, a round with a
+forced unfinished flow is timed by the full simulation budget (not its finished flows
+only), and waiting time is never negative across a small sweep;
 `tests/test_e2_throughput.py`'s independent re-implementation of the collision-ceiling
 result (different path-enumeration code, different max-min solver, lands within 3 points
 of ~47% at k=8); and the underlying topology/failure/routing/flow-level machinery each

@@ -4,8 +4,11 @@
 # Step 1: go-back-N timeout recovery + separate RTO backoff). PHASE4.md Step 6.
 #
 # k=4 always run; k=8 run too if runtime allows (analysis.py's e3-incast
-# --ks flag). M (senders) swept per k; buffer size and min_rto_ms swept
-# per figure; fat-tree vs traditional-tree compared at one buffer/RTO point.
+# --ks flag). M (senders) swept per k -- at k=4 with sender_placement
+# other-pods there are only 12 hosts outside the receiver's pod, so M must
+# be <= 12 (generate_pairs raises otherwise, PHASE6.md Step 1); default
+# sweep is M in {1, 2, 4, 8, 12}. Buffer size and min_rto_ms swept per
+# figure; fat-tree vs traditional-tree compared at one buffer/RTO point.
 topology:
   k: 4
 routing: two-level
