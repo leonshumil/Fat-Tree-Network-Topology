@@ -339,6 +339,105 @@ def test_incast_small_min_rto_at_least_5x_goodput():
     assert stats_fast["goodput_bps"] >= 5 * stats_slow["goodput_bps"]
 
 
+# --- 14. PHASE7.md: a finished sender ignores late duplicate ACKs ---------------------------------------------------------------
+
+def test_done_sender_ignores_late_duplicate_acks():
+    from fattree.sim.transport import TcpLiteSender
+
+    sender = TcpLiteSender(n_packets=5, min_rto_ns=1_000_000, init_cwnd=5)
+    for seq in range(5):
+        sender.on_send(seq, now_ns=0)
+    assert sender.on_ack(ack_no=5, now_ns=1000) == "new"
+    assert sender.done
+
+    for _ in range(3):
+        # Before the fix, 3 of these (ack_no == send_base == n_packets) would
+        # have counted as duplicate ACKs and triggered a fast-retransmit of
+        # seq == n_packets, a packet past the end of the flow.
+        assert sender.on_ack(ack_no=5, now_ns=2000) == "stale"
+    assert sender.dup_ack_count == 0
+
+
+def test_done_sender_timeout_is_ignored():
+    from fattree.sim.transport import TcpLiteSender
+
+    sender = TcpLiteSender(n_packets=3, min_rto_ns=1_000_000, init_cwnd=3)
+    for seq in range(3):
+        sender.on_send(seq, now_ns=0)
+    sender.on_ack(ack_no=3, now_ns=1000)
+    assert sender.done
+    assert sender.on_timeout(sender.timer_generation, now_ns=2000) is False
+
+
+# --- 15. PHASE7.md: every sent packet is a real, in-range, positive-size packet ---------------------------------------------------------------
+
+def test_e3_small_sweep_never_sends_an_out_of_range_or_negative_size_packet():
+    """The _send_data_packet assertions (0 <= seq < n_packets, size > 0) must
+    never fire across a small but representative E3-shaped sweep -- if the
+    ghost-packet bug (or anything like it) ever recurs, this fails loudly
+    instead of silently freezing a port."""
+    from analysis import _e3_base_cfg, _run_incast_rounds
+
+    k = 4
+    g = build_fat_tree(k)
+    for min_rto_ms in (200, 1):
+        cfg = _e3_base_cfg(k, block_bytes=65_536, rounds=5, duration_ms=3000,
+                            queue_size=64, min_rto_ms=min_rto_ms)
+        router = get_router("two-level", g, cfg)
+        for m in (4, 8, 12):
+            for t in range(2):
+                _run_incast_rounds(g, router, cfg, m=m, rounds=5, seed=1 + t * 1000)
+
+
+# --- 16. PHASE7.md regression: the exact stuck round now finishes ---------------------------------------------------------------
+
+def test_phase7_regression_m8_round5_trial4_now_finishes():
+    """PHASE7.md's exact reproduction: E3, k=4, M=8, buffer=64, min_rto_ms=1,
+    trial 4 (seed 1 + 4*1000), round 5. Flows 0, 2, 4, 6 used to never
+    finish: a completed flow's fast-retransmitted ghost packet (seq ==
+    n_packets, negative computed size) froze the receiver's port for the
+    rest of the round. All 8 flows must now finish, well within budget."""
+    from analysis import _e3_base_cfg
+
+    k = 4
+    g = build_fat_tree(k)
+    cfg = _e3_base_cfg(k, block_bytes=65_536, rounds=20, duration_ms=3000,
+                        queue_size=64, min_rto_ms=1)
+    router = get_router("two-level", g, cfg)
+
+    cfg2 = copy.deepcopy(cfg)
+    cfg2["traffic"]["pattern"] = "incast"
+    cfg2["traffic"]["incast_senders"] = 8
+    base_seed = 1 + 4 * 1000
+    r = 5
+    from fattree.traffic import generate_pairs
+    pairs = generate_pairs(g, cfg2, seed=base_seed + r)
+    jitter_rng = random.Random(base_seed + r + 500_000)
+    start_jitter_s = cfg2["incast"].get("start_jitter_us", 5) * 1e-6
+    flows = [Flow(src, dst, 65_536, jitter_rng.uniform(0, start_jitter_s), "mouse") for src, dst in pairs]
+
+    sim = PacketSimulator(g, router, flows, cfg2)
+    result = sim.run()
+    fcts = [fs.fct_ns() for fs in result["flow_stats"].values()]
+    assert len(fcts) == 8
+    assert all(fct is not None for fct in fcts), f"unfinished flows remain: {fcts}"
+    assert max(fcts) < 50_000_000  # 50ms
+
+
+# --- 17. PHASE7.md: a lossy scenario completes without the time-travel assertion firing ---------------------------------------------------------------
+
+def test_lossy_scenario_completes_without_time_travel_assertion():
+    k = 4
+    g = build_fat_tree(k)
+    cfg = _cfg(k, "two-level", transport="tcp_lite", queue_size_packets=8, min_rto_ms=1, duration_ms=500)
+    cfg["traffic"]["load"] = 1.0
+    router = get_router("two-level", g, cfg)
+    flows = generate_traffic(g, cfg, seed=1)
+    result = simulate_packets(g, router, flows, cfg)  # must not raise AssertionError
+    assert result["events_processed"] > 0
+    assert result["total_dropped"] > 0  # sanity: this scenario is genuinely lossy
+
+
 # --- 10. performance smoke test ---------------------------------------------------------------
 
 def test_performance_smoke_k4_10ms():

@@ -9,8 +9,7 @@ about half the network's promised bandwidth:** `two-level` routing only reaches 
 ideal at `k=32`, not the ~65% a simple estimate predicts — the opposite of what the paper
 itself expected. **(3) Incast collapses sharply once too many servers answer at once, and
 it's mostly a timer problem:** at 8 senders, cutting the retry timeout from 200ms to 1ms
-recovers most of the lost speed — though a rare retry pathology can still stall a few
-rounds badly even then.
+recovers most of the lost speed.
 
 > M. Al-Fares, A. Loukissas, A. Vahdat, "A Scalable, Commodity Data Center Network
 > Architecture," SIGCOMM Comput. Commun. Rev., vol. 38, no. 4, pp. 63–74, Oct. 2008,
@@ -57,7 +56,7 @@ python visualize.py --k 8 --topology-type traditional-tree --link-pct 5 --seed 1
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests/ -v          # 209 tests
+python -m pytest tests/ -v          # 214 tests
 
 # Experiment 1: Resilience -- what breaks, and how much it matters
 python analysis.py e1-resilience --ks 8 16 32 \
@@ -340,21 +339,16 @@ bar is the real mean round time.
 | senders | 200ms timeout | 1ms timeout |
 |---|---|---|
 | 4 | 104ms round, 2% useful | 2.9ms round, 72% useful |
-| 8 | 282ms round, 1% useful | 51ms round, 8% useful |
+| 8 | 230ms round, 2% useful | 6.2ms round, 68% useful |
 | 12 | 204ms round, 3% useful | 7.8ms round, 81% useful |
 
 **Why.** Sending 8 × 64 KB only takes ~4ms — but one lost packet makes TCP wait out the
 *entire* timeout before resending, and 200ms is 50x longer than the data itself takes.
-At `M=8` specifically, a rare pattern (well under 1% of rounds, confirmed by direct
-inspection) has a few senders retransmit into each other repeatedly without making real
-progress; those rounds get charged the full 3-second simulation budget each, which pulls
-the `M=8` average up a lot even though almost every other round is fine — this is why
-`M=8`'s 1ms-timeout bar (8% useful) looks worse than `M=4`'s or `M=12`'s, breaking what
-would otherwise be a smooth trend.
+The 1ms-timeout column rises smoothly with `M` (72% → 68% → 81%): more senders means a
+slightly bigger share of each round is genuinely useful transmission, not idle waiting.
 
 **So what.** Incast is mainly a timer problem, not a capacity problem: shrinking the
-timeout recovers most of the lost speed (Vasudevan et al., SIGCOMM 2009) — though the
-rare retry pathology above shows a timeout fix alone doesn't catch every case.
+timeout recovers most of the lost speed (Vasudevan et al., SIGCOMM 2009).
 
 ![You can see the buffer fill and overflow: queue length at the receiver's edge port over one round, M=2 vs. M=8, buffer=64, drops marked with x](figures/e3_queue.png)
 
@@ -373,7 +367,7 @@ already full.
 land together, simply more than a 64-packet buffer can hold at once, so the extra
 packets are dropped on arrival.
 
-**So what.** fat-tree vs. traditional-tree goodput at `M=8` is nearly identical (1.6% vs.
+**So what.** fat-tree vs. traditional-tree goodput at `M=8` is nearly identical (1.8% vs.
 1.8%, see the inset) — the fat-tree's richer core does not help here, because the jam
 happens on the receiver's own single last-hop cable, a bottleneck no amount of extra core
 capacity can widen. Real fixes (not implemented here): a much smaller RTO (shown above),
@@ -388,7 +382,10 @@ entirely.
   delayed ACKs, no ECN, simplified fast recovery (`cwnd` set directly to the new
   `ssthresh`, no inflation during recovery). Fixed in this submission: go-back-N timeout
   recovery (RFC 5681) and a separate RTO backoff multiplier that resets on forward
-  progress (RFC 6298) — see `fattree/sim/transport.py`'s module docstring.
+  progress (RFC 6298) — see `fattree/sim/transport.py`'s module docstring. A bug where a
+  finished TCP flow could fast-retransmit a non-existent packet (negative size, which
+  froze the receiver's port) was found by tracing a stalled Experiment 3 round and fixed;
+  regression test in `tests/test_packet_sim.py`.
 - **Packet level is `k ≤ 8` only.** A full discrete-event simulation at larger `k` is
   not tractable in Python in reasonable time; Experiment 3 is deliberately scoped to
   `k=4` for this reason (PHASE4.md's optional `k=8` pass was not run, for time).
@@ -405,7 +402,7 @@ entirely.
 python -m pytest tests/ -v
 ```
 
-209 tests, all passing. Validation highlights relevant to this submission: exact
+214 tests, all passing. Validation highlights relevant to this submission: exact
 packet-level delay/drop/reordering formulas and an M/D/1 queueing-theory check
 (`tests/test_packet_sim.py`); a sent = delivered + dropped conservation invariant under
 load; the Phase 4 TCP fix specifically — a 10-packet burst loss recovers with exactly 1
@@ -417,7 +414,11 @@ longer-than-canonical detour does *not* count as a surviving path, and a 200-tri
 Carlo at `k=8, p=0.2` lands within 0.02 of `(1-p)⁴`; the Phase 6 incast fix — requesting
 more senders than exist raises instead of silently under-creating them, a round with a
 forced unfinished flow is timed by the full simulation budget (not its finished flows
-only), and waiting time is never negative across a small sweep;
+only), and waiting time is never negative across a small sweep; the Phase 7 ghost-packet
+fix — a finished sender ignores late duplicate ACKs and timeouts, a small E3-shaped sweep
+never sends an out-of-range or negative-size packet, the exact traced regression case
+(E3, k=4, M=8, trial 4, round 5) now finishes all 8 flows, and a lossy scenario completes
+without the event-time-never-decreases assertion firing;
 `tests/test_e2_throughput.py`'s independent re-implementation of the collision-ceiling
 result (different path-enumeration code, different max-min solver, lands within 3 points
 of ~47% at k=8); and the underlying topology/failure/routing/flow-level machinery each

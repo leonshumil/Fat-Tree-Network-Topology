@@ -64,7 +64,16 @@ def test_low_load_slowdown_near_1(scheme):
     # bug resent. That's more retransmitted bytes per loss, by design -- the
     # old <1.2 bound only held because the bug under-recovered multi-packet
     # bursts (see PHASE4.md Step 1), not because recovery was actually cheap.
-    assert mean_slowdown < 3.0
+    # Loosened again, 3.0 -> 4.0, by the Phase 7 ghost-packet fix (see
+    # fattree/sim/packet.py's _enqueue/_start_tx and transport.py's
+    # TcpLiteSender.on_ack/on_timeout): single-path at min_rto_ms=1 used to
+    # leave 3 of 37 flows permanently stuck (a receiver port frozen by a
+    # finished flow's fast-retransmitted ghost packet, PHASE7.md), silently
+    # excluded from this mean as "unfinished." All 37 now finish, including
+    # those worst-case ones, which legitimately pulls the mean up -- this is
+    # the simulator being more correct (no more flows silently lost to a
+    # port-freeze bug), not a new regression.
+    assert mean_slowdown < 4.0
 
 
 # --- offered load accuracy --------------------------------------------------------------------

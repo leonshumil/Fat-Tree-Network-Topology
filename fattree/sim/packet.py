@@ -109,6 +109,7 @@ class PacketSimulator:
         self.total_dropped = 0
         self.packet_delays_ns = []
         self.packet_queue_delays_ns = []
+        self.last_time_ns = 0
 
         self._build()
 
@@ -171,6 +172,12 @@ class PacketSimulator:
             time_ns, _, kind, payload = heapq.heappop(self._events)
             if time_ns > self.duration_ns:
                 break
+            if time_ns < self.last_time_ns:
+                raise AssertionError(
+                    f"event time went backwards: {kind} at {time_ns}ns after {self.last_time_ns}ns "
+                    f"-- time travel must be impossible, not silently tolerated (see PHASE7.md)"
+                )
+            self.last_time_ns = time_ns
             self.events_processed += 1
             if kind == "send":
                 self._handle_send(time_ns, payload)
@@ -189,7 +196,12 @@ class PacketSimulator:
 
     def _send_data_packet(self, idx, seq, now_ns):
         flow = self.flows[idx]
-        size = self._size_for_seq(flow, seq, self.flow_n_packets[idx])
+        n_packets = self.flow_n_packets[idx]
+        if not (0 <= seq < n_packets):
+            raise AssertionError(f"flow {idx}: refusing to send seq {seq}, outside [0, {n_packets})")
+        size = self._size_for_seq(flow, seq, n_packets)
+        if size <= 0:
+            raise AssertionError(f"flow {idx}: computed size {size} <= 0 for seq {seq} (n_packets={n_packets})")
         path = self._packet_path(self.flow_paths[idx])
         is_retx = False
         if idx in self.senders:
@@ -242,7 +254,17 @@ class PacketSimulator:
         pkt.hop_enqueue_time_ns = now_ns
         q.append(pkt)
         self.port_stats[key].record_queue_len(now_ns, len(q))
-        if was_empty and self.link_free_at_ns.get(key, 0) <= now_ns:
+        if was_empty:
+            # Always kick off transmission when the queue was empty, even if
+            # link_free_at_ns[key] is still in the future (_start_tx's own
+            # start = max(now, link_free_at) already handles that case
+            # correctly). The old `and link_free_at_ns.get(key, 0) <= now_ns`
+            # guard assumed a transmission must already be scheduled whenever
+            # the link looked "busy" -- true unless that busy time came from
+            # a since-sent packet with a corrupt (e.g. negative-size, from
+            # PHASE7.md's ghost-packet bug) transmission time computed
+            # *before* the current time, in which case nothing was actually
+            # scheduled and this port would silently never transmit again.
             self._start_tx(key, now_ns)
 
     def _start_tx(self, key, now_ns):
@@ -253,6 +275,8 @@ class PacketSimulator:
         start = max(now_ns, self.link_free_at_ns.get(key, 0))
         pkt.queue_delay_ns += start - pkt.hop_enqueue_time_ns
         tx_time_ns = int(pkt.size_bytes * 8 * 1e9 / self.capacity_bps)
+        if tx_time_ns <= 0:
+            raise AssertionError(f"link {key}: non-positive transmission time {tx_time_ns}ns for a {pkt.size_bytes}-byte packet")
         done = start + tx_time_ns
         self.link_free_at_ns[key] = done
         self._schedule(done, "tx_done", key)

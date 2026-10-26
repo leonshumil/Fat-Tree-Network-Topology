@@ -29,7 +29,14 @@ tcp_lite: a simplified Reno-like reliable transport --
     again, with no sample ever available to bring the estimate back down.
     cwnd resets to 1 packet on timeout. A stale timeout event (from a
     since-superseded RTO generation) is detected via `timer_generation` and
-    ignored by the caller.
+    ignored by the caller. A completed flow (`done`) ignores every late ACK
+    (ACKs for a flow's own earlier, already-superseded go-back-N resends can
+    still arrive after it finishes) and never times out again -- PHASE7.md's
+    bug: without this, 3 duplicate ACKs after completion triggered a
+    fast-retransmit of seq == n_packets, a packet past the end of the flow
+    with a negative computed size, which froze the receiving port's queue
+    (see fattree/sim/packet.py's `_enqueue`/`_start_tx` for the other half
+    of the fix) for the rest of the simulated round.
 
 NOT implemented (documented limitation, see README): SACK, delayed ACKs, ECN,
 slow-start-after-idle, full NewReno partial-ACK handling during fast recovery.
@@ -126,6 +133,8 @@ class TcpLiteSender:
 
     def on_ack(self, ack_no, now_ns):
         """Returns 'new' | 'dup' | 'fast_retransmit' | 'stale'."""
+        if self.done:
+            return "stale"  # a finished flow ignores every late ACK -- see PHASE7.md
         if ack_no == self.send_base:
             self.dup_ack_count += 1
             if self.dupack_threshold is not None and self.dup_ack_count == self.dupack_threshold:
@@ -156,6 +165,8 @@ class TcpLiteSender:
 
     def on_timeout(self, generation, now_ns):
         """Returns True if this was a live (non-stale) timeout that was acted on."""
+        if self.done:
+            return False  # a finished flow never times out again -- see PHASE7.md
         if generation != self.timer_generation:
             return False
         self.ssthresh = max(self.cwnd / 2, 2.0)
